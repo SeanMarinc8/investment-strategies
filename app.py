@@ -55,7 +55,7 @@ os.environ["DATABASE_URL"] = database_url
 try:
     engine = db()
     init(engine)
-    lab.setup(engine)
+    lab.initialize(engine)
 
     with engine.begin() as conn:
         conn.execute(text("""
