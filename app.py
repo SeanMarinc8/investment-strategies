@@ -7,21 +7,17 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+import streamlit as st
+import yfinance as yf
 from sqlalchemy import text
 
+import strategy_lab as lab
 from engine import (
     db, init, read, run, prices,
-    score_frame, WATCH, START_CASH
+    score_frame, holdings, WATCH, START_CASH
 )
-import strategy_lab as lab
-
-
-# ============================================================
-# PAGE SETUP AND LOGIN
-# ============================================================
 
 st.set_page_config(
     page_title="AI Investment Research Lab",
@@ -31,30 +27,35 @@ st.set_page_config(
 
 st.title("📈 AI Investment Research Lab")
 st.caption(
-    "Investment research • Six paper-trading models • "
-    "Personal portfolio comparison • No real brokerage orders"
+    "Market research • Simulated investment strategies • "
+    "Personal portfolio • Educational use only"
 )
+
+# ============================================================
+# LOGIN
+# ============================================================
 
 try:
-    APP_PASSWORD = str(st.secrets["APP_PASSWORD"])
-    DATABASE_URL = str(st.secrets["DATABASE_URL"])
+    password_secret = str(st.secrets["APP_PASSWORD"])
+    database_url = str(st.secrets["DATABASE_URL"])
 except Exception:
-    st.error("Configure APP_PASSWORD and DATABASE_URL in Streamlit Secrets.")
+    st.error(
+        "APP_PASSWORD and DATABASE_URL must be "
+        "configured in Streamlit Secrets."
+    )
     st.stop()
 
-entered_password = st.text_input(
-    "App password", type="password"
-)
+entered = st.text_input("App password", type="password")
 
-if not hmac.compare_digest(entered_password, APP_PASSWORD):
+if not hmac.compare_digest(entered, password_secret):
     st.stop()
 
-os.environ["DATABASE_URL"] = DATABASE_URL
+os.environ["DATABASE_URL"] = database_url
 
 try:
     engine = db()
     init(engine)
-    lab.initialize(engine)
+    lab.setup(engine)
 
     with engine.begin() as conn:
         conn.execute(text("""
@@ -64,6 +65,7 @@ try:
                 cost_basis DOUBLE PRECISION
             )
         """))
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS personal_snapshots (
                 snapshot_date DATE PRIMARY KEY,
@@ -72,296 +74,78 @@ try:
                 missing_count INTEGER NOT NULL
             )
         """))
+
 except Exception as exc:
-    st.error(f"Database initialization failed: {type(exc).__name__}")
+    st.error(
+        "Database initialization failed: "
+        + type(exc).__name__
+    )
     st.stop()
 
 ET = ZoneInfo("America/New_York")
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-def eastern_now():
-    return datetime.now(ET)
-
-
-def market_ready():
-    now = eastern_now()
-    return now.weekday() < 5 and (now.hour, now.minute) >= (16, 20)
-
-
-def strategy_tables():
-    return (
-        lab.load(engine, "lab_trades"),
-        lab.load(engine, "lab_snapshots")
-    )
-
-
-def personal_holdings():
-    return pd.read_sql_query(
-        text("SELECT ticker, shares, cost_basis FROM personal_holdings ORDER BY ticker"),
-        engine
-    )
-
-
-def personal_snapshots():
-    return pd.read_sql_query(
-        text("SELECT * FROM personal_snapshots ORDER BY snapshot_date"),
-        engine
-    )
-
-
-def save_holdings(frame):
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM personal_holdings"))
-
-        for row in frame.itertuples():
-            conn.execute(text("""
-                INSERT INTO personal_holdings
-                (ticker, shares, cost_basis)
-                VALUES (:ticker, :shares, :cost)
-            """), {
-                "ticker": row.ticker,
-                "shares": float(row.shares),
-                "cost": (
-                    None if pd.isna(row.cost_basis)
-                    else float(row.cost_basis)
-                )
-            })
-
 
 # ============================================================
 # MARKET DATA
 # ============================================================
 
-def fetch_market_history(tickers, period="1y"):
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(ticker, period="1y"):
     """
-    Downloads historical adjusted prices.
+    Download a single ticker independently.
 
-    Ticker data is downloaded separately to prevent
-    changing the selected asset list from changing
-    the historical comparison window.
-
-    Invalid tickers are reported rather than silently
-    substituted with other securities.
+    This prevents the selected chart components
+    from affecting the price history of other stocks.
     """
-    tickers = list(dict.fromkeys(
-        str(t).upper().strip()
-        for t in tickers if str(t).strip()
-    ))
+    ticker = str(ticker).upper().strip()
 
-    if not tickers:
-        return pd.DataFrame(), []
-
-    series_list = []
-    missing = []
-
-    for ticker in tickers:
-        try:
-            data = lab.fetch_history([ticker], period)
-
-            if ticker not in data.columns:
-                missing.append(ticker)
-                continue
-
-            s = pd.to_numeric(
-                data[ticker], errors="coerce"
-            ).dropna()
-
-            s = s[s > 0]
-
-            if s.empty:
-                missing.append(ticker)
-                continue
-
-            idx = pd.to_datetime(s.index)
-
-            if idx.tz is not None:
-                idx = idx.tz_localize(None)
-
-            s.index = idx.normalize()
-            s = s[~s.index.duplicated(keep="last")]
-            s.name = ticker
-
-            series_list.append(s)
-
-        except Exception:
-            missing.append(ticker)
-
-    if not series_list:
-        return pd.DataFrame(), missing
-
-    history = pd.concat(
-        series_list, axis=1, join="outer"
-    ).sort_index()
-
-    return history, missing
-
-
-def get_portfolio_weights():
-    """
-    Calculates weights using current share quantities
-    multiplied by latest available adjusted prices.
-    """
-    frame = personal_holdings()
-
-    if frame.empty:
-        return {}, 0.0, ["No holdings saved yet."]
-
-    history, unavailable = fetch_market_history(
-        frame["ticker"].tolist(), "1mo"
+    raw = yf.download(
+        ticker,
+        period=period,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False
     )
 
-    if unavailable:
-        return {}, 0.0, unavailable
-
-    values = {}
-
-    for row in frame.itertuples():
-        ticker = str(row.ticker)
-        s = history[ticker].dropna()
-
-        if s.empty:
-            return {}, 0.0, [ticker]
-
-        values[ticker] = float(row.shares) * float(s.iloc[-1])
-
-    total = sum(values.values())
-
-    if total <= 0:
-        return {}, 0.0, ["Portfolio market value is zero."]
-
-    weights = {
-        ticker: value / total
-        for ticker, value in values.items()
-        if value > 0
-    }
-
-    return weights, total, []
-
-
-def simulate_personal_portfolio(history, weights):
-    """
-    Historical buy-and-hold simulation.
-
-    Applies today's allocation percentages at the
-    beginning of the first date when every holding
-    has valid historical prices.
-
-    Does not alter individual stock histories.
-    """
-    if not weights or history.empty:
+    if raw.empty:
         return pd.Series(dtype=float)
 
-    tickers = list(weights)
+    if isinstance(raw.columns, pd.MultiIndex):
+        series = raw["Close"][ticker]
+    else:
+        series = raw["Close"]
 
-    if any(t not in history.columns for t in tickers):
-        return pd.Series(dtype=float)
-
-    data = history[tickers].copy()
-    data = data.apply(pd.to_numeric, errors="coerce")
-
-    # Only fill gaps after the first valid observation.
-    data = data.ffill().dropna(how="any")
-    data = data[(data > 0).all(axis=1)]
-
-    if len(data) < 2:
-        return pd.Series(dtype=float)
-
-    starting_prices = data.iloc[0]
-
-    shares = {
-        ticker: (
-            10000 * weights[ticker] /
-            float(starting_prices[ticker])
-        )
-        for ticker in tickers
-    }
-
-    value = pd.Series(
-        0.0, index=data.index, dtype=float
-    )
-
-    for ticker, quantity in shares.items():
-        value += data[ticker] * quantity
-
-    value.name = "My Portfolio ($10K)"
-    return value
-
-
-def value_actual_portfolio(record=False):
-    frame = personal_holdings()
-
-    if frame.empty:
-        return frame, [], 0.0
-
-    history, unavailable = fetch_market_history(
-        frame["ticker"].tolist(), "1mo"
-    )
-
-    quotes = {}
-
-    for ticker in frame["ticker"]:
-        if ticker in history.columns:
-            s = history[ticker].dropna()
-            if not s.empty:
-                quotes[ticker] = float(s.iloc[-1])
-
-    frame["last_price"] = frame["ticker"].map(quotes)
-    frame["market_value"] = (
-        frame["shares"] * frame["last_price"]
-    )
-
-    missing = sorted(set(
-        unavailable +
-        frame.loc[
-            frame["last_price"].isna(), "ticker"
-        ].tolist()
-    ))
-
-    total = float(frame["market_value"].sum())
-
-    if record and not missing:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO personal_snapshots
-                (snapshot_date, market_value, priced_count, missing_count)
-                VALUES (:d, :v, :n, 0)
-                ON CONFLICT (snapshot_date)
-                DO UPDATE SET
-                    market_value = EXCLUDED.market_value,
-                    priced_count = EXCLUDED.priced_count,
-                    missing_count = 0
-            """), {
-                "d": eastern_now().date(),
-                "v": total,
-                "n": len(frame)
-            })
-
-    return frame, missing, total
-
-
-# ============================================================
-# CHART HELPERS
-# ============================================================
-
-def normalize_to_10000(series):
-    s = pd.to_numeric(
+    series = pd.to_numeric(
         series, errors="coerce"
     ).dropna()
 
-    s = s[s > 0]
+    series = series[series > 0]
 
-    if len(s) < 2:
+    idx = pd.to_datetime(series.index, utc=True)
+    series.index = idx.tz_localize(None).normalize()
+
+    series = series[
+        ~series.index.duplicated(keep="last")
+    ]
+
+    series.name = ticker
+
+    return series.sort_index()
+
+
+def normalized(series):
+    series = series.dropna()
+
+    if len(series) < 2:
         return pd.Series(dtype=float)
 
-    return 10000.0 * s / float(s.iloc[0])
+    return series / float(series.iloc[0]) * 10000
 
 
-def add_line(fig, series, label, color=None,
-             width=2, dash="solid"):
+def add_line(
+    fig, series, name,
+    color=None, width=2, dash="solid"
+):
     if series.empty:
         return
 
@@ -373,73 +157,236 @@ def add_line(fig, series, label, color=None,
     fig.add_trace(go.Scatter(
         x=series.index,
         y=series.values,
-        name=label,
-        mode="lines+markers" if len(series) == 1 else "lines",
+        mode="lines",
+        name=name,
         line=line,
+        connectgaps=False,
         hovertemplate=(
-            "%{x|%b %d, %Y}<br>$%{y:,.2f}"
+            "%{x|%b %d, %Y}<br>"
+            "$%{y:,.2f}"
             "<extra>%{fullData.name}</extra>"
         )
     ))
 
 
-def style_chart(fig, title, ylabel="Growth of $10,000"):
+def format_chart(fig, title):
     fig.update_layout(
         title=title,
         height=600,
         hovermode="x unified",
         xaxis_title="Date",
-        yaxis_title=ylabel,
-        legend=dict(orientation="h", y=-0.24),
-        margin=dict(t=65, b=130)
+        yaxis_title="Growth of $10,000",
+        legend=dict(
+            orientation="h",
+            y=-0.24,
+            x=0
+        ),
+        margin=dict(t=70, b=140)
     )
-    fig.update_yaxes(tickprefix="$", tickformat=",.0f")
-    return fig
+    fig.update_yaxes(
+        tickprefix="$",
+        tickformat=",.0f"
+    )
 
 
 # ============================================================
-# AUTOMATIC STRATEGY CHECK
+# PERSONAL HOLDINGS
 # ============================================================
 
-def update_due_strategies():
-    if not market_ready():
-        return []
+def load_holdings():
+    return pd.read_sql_query(
+        text("""
+            SELECT ticker, shares, cost_basis
+            FROM personal_holdings
+            ORDER BY ticker
+        """),
+        engine
+    )
 
-    _, snapshots = strategy_tables()
-    today = eastern_now().date()
 
-    completed = set()
-
-    if not snapshots.empty:
-        dates = pd.to_datetime(
-            snapshots["run_date"]
-        ).dt.date
-
-        completed = set(
-            snapshots.loc[
-                dates == today, "strategy"
-            ]
+def save_holdings(frame):
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM personal_holdings")
         )
 
-    results = []
+        for row in frame.itertuples():
+            conn.execute(text("""
+                INSERT INTO personal_holdings
+                (ticker, shares, cost_basis)
+                VALUES (:ticker, :shares, :cost)
+            """), {
+                "ticker": row.ticker,
+                "shares": float(row.shares),
+                "cost": (
+                    None
+                    if pd.isna(row.cost_basis)
+                    else float(row.cost_basis)
+                )
+            })
 
-    for name in lab.MODELS:
-        if name in completed:
+
+def portfolio_weights():
+    frame = load_holdings()
+
+    if frame.empty:
+        return {}, 0, ["No saved holdings"]
+
+    weights = {}
+    missing = []
+
+    for row in frame.itertuples():
+        ticker = str(row.ticker)
+        history = get_history(ticker, "1mo")
+
+        if history.empty:
+            missing.append(ticker)
             continue
 
-        try:
-            result = lab.run_strategy(engine, name)
-            results.append({
-                "strategy": name,
-                "result": str(result)[:250]
-            })
-        except Exception as exc:
-            results.append({
-                "strategy": name,
-                "error": str(exc)[:200]
-            })
+        price = float(history.iloc[-1])
+        value = float(row.shares) * price
 
-    return results
+        if value > 0:
+            weights[ticker] = value
+
+    total = sum(weights.values())
+
+    if total <= 0:
+        return {}, 0, missing
+
+    weights = {
+        ticker: value / total
+        for ticker, value in weights.items()
+    }
+
+    return weights, total, missing
+
+
+# ============================================================
+# NEW: FULL-PERIOD PERSONAL PORTFOLIO SIMULATION
+# ============================================================
+
+def simulate_portfolio_full_period(weights, period):
+    """
+    Historical simulation starting at the beginning
+    of the selected market-data period.
+
+    Each holding receives its current portfolio weight
+    multiplied by $10,000.
+
+    If a holding has no price at the starting date,
+    its allocation stays in cash until the first
+    available valid trading price.
+
+    Once purchased, shares are held for the remainder
+    of the simulation.
+
+    This is a hypothetical cash-until-available
+    methodology, not actual historical transactions.
+    """
+
+    if not weights:
+        return pd.Series(dtype=float), []
+
+    histories = {}
+    unavailable = []
+
+    for ticker in weights:
+        series = get_history(ticker, period)
+
+        if series.empty:
+            unavailable.append(ticker)
+        else:
+            histories[ticker] = series
+
+    if not histories:
+        return pd.Series(dtype=float), unavailable
+
+    # Use the full union of available trading dates.
+    # Do not require every asset to have prices
+    # on the first date.
+    all_dates = sorted(set().union(
+        *(series.index for series in histories.values())
+    ))
+
+    index = pd.DatetimeIndex(all_dates)
+
+    if len(index) < 2:
+        return pd.Series(dtype=float), unavailable
+
+    # Each position starts with a fixed dollar budget.
+    # That budget remains in cash until the security
+    # has its first valid historical observation.
+    cash_allocations = {
+        ticker: 10000.0 * weight
+        for ticker, weight in weights.items()
+    }
+
+    # Unavailable holdings stay in cash throughout.
+    for ticker in unavailable:
+        cash_allocations[ticker] = (
+            10000.0 * weights[ticker]
+        )
+
+    shares = {
+        ticker: 0.0
+        for ticker in weights
+    }
+
+    purchased = {
+        ticker: False
+        for ticker in weights
+    }
+
+    aligned = {}
+
+    for ticker, series in histories.items():
+        aligned[ticker] = series.reindex(index).ffill()
+
+    values = []
+
+    for date in index:
+
+        # Buy each holding on its first valid date.
+        for ticker in histories:
+
+            price = aligned[ticker].loc[date]
+
+            if (
+                not purchased[ticker]
+                and pd.notna(price)
+                and float(price) > 0
+            ):
+                shares[ticker] = (
+                    cash_allocations[ticker]
+                    / float(price)
+                )
+
+                cash_allocations[ticker] = 0.0
+                purchased[ticker] = True
+
+        total_cash = sum(cash_allocations.values())
+        invested_value = 0.0
+
+        for ticker in histories:
+
+            price = aligned[ticker].loc[date]
+
+            if purchased[ticker] and pd.notna(price):
+                invested_value += (
+                    shares[ticker] * float(price)
+                )
+
+        values.append(total_cash + invested_value)
+
+    result = pd.Series(
+        values,
+        index=index,
+        name="My Portfolio ($10K)",
+        dtype=float
+    )
+
+    return result, unavailable
 
 
 # ============================================================
@@ -447,735 +394,643 @@ def update_due_strategies():
 # ============================================================
 
 page = st.sidebar.radio(
-    "Navigation",
+    "Pages",
     [
-        "Strategy Lab",
+        "Dashboard",
         "Research",
-        "Original AI Strategy",
+        "Strategy Lab",
         "Daily Decisions",
         "Trade Log",
         "My Portfolio",
-        "Methodology"
+        "Data & Methodology"
     ]
 )
 
-if st.sidebar.button("Refresh dashboard"):
+if st.sidebar.button("Refresh market data"):
+    st.cache_data.clear()
     st.rerun()
 
-today = eastern_now().date()
-
-if (
-    market_ready()
-    and st.session_state.get("last_auto_check") != today
-):
-    with st.spinner("Checking daily strategy updates..."):
-        auto_results = update_due_strategies()
-
-    if not any("error" in r for r in auto_results):
-        st.session_state["last_auto_check"] = today
-
-    if auto_results:
-        st.sidebar.info("Daily strategy update check completed.")
-
+st.sidebar.caption(
+    "Market prices are recent available daily closes. "
+    "Simulated trades require a completed model run."
+)
 
 # ============================================================
-# STRATEGY LAB
+# DASHBOARD
 # ============================================================
 
-if page == "Strategy Lab":
+if page == "Dashboard":
 
-    st.header("🏦 Multi-Strategy Investment Lab")
+    st.header("📊 Investment Dashboard")
 
-    st.write(
-        "Compare six independently simulated investment "
-        "strategies and your saved personal portfolio."
-    )
+    snapshots = read(engine, "snapshots")
 
-    if st.button("Run missing paper strategies", type="primary"):
-        if not market_ready():
-            st.warning(
-                "Strategy updates run on weekdays "
-                "after 4:20 PM Eastern."
-            )
-        else:
-            results = update_due_strategies()
-            if results:
-                st.dataframe(
-                    pd.DataFrame(results),
-                    hide_index=True,
-                    use_container_width=True
-                )
-            else:
-                st.success("Today's model snapshots already exist.")
-
-    st.caption(
-        "GitHub Actions can update strategies while "
-        "Streamlit is closed, provided the scheduled "
-        "workflow is configured and running successfully."
-    )
-
-    trades, snapshots = strategy_tables()
-    my_history = personal_snapshots()
-
-    st.subheader("All Portfolio Performance")
-
-    names = list(lab.MODELS) + ["My Portfolio"]
-
-    selected = st.multiselect(
-        "Show strategies",
-        names,
-        default=names
-    )
-
-    display_mode = st.radio(
-        "Chart metric",
-        ["Normalized $10,000", "Recorded Dollar Value"],
-        horizontal=True
-    )
-
-    fig = go.Figure()
-
-    for name in selected:
-        if name == "My Portfolio":
-            if my_history.empty:
-                continue
-
-            rows = my_history.sort_values("snapshot_date")
-            series = pd.Series(
-                rows["market_value"].astype(float).values,
-                index=pd.to_datetime(rows["snapshot_date"])
-            )
-
-            if display_mode.startswith("Normalized"):
-                series = normalize_to_10000(series)
-
-            add_line(
-                fig, series, name,
-                color="#F59E0B", width=4, dash="dash"
-            )
-
-        else:
-            if snapshots.empty:
-                continue
-
-            rows = snapshots[
-                snapshots["strategy"] == name
-            ].sort_values("run_date")
-
-            if rows.empty:
-                continue
-
-            series = pd.Series(
-                rows["equity"].astype(float).values,
-                index=pd.to_datetime(rows["run_date"])
-            )
-
-            if display_mode.startswith("Normalized"):
-                # Models start with $10,000, so preserve
-                # their true simulated initial capital.
-                pass
-
-            add_line(fig, series, name, width=3)
-
-    ylabel = (
-        "Normalized Value ($)"
-        if display_mode.startswith("Normalized")
-        else "Recorded Portfolio Value ($)"
-    )
-
-    style_chart(
-        fig, "AI Strategies vs My Portfolio", ylabel
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        "The simulated strategies start at $10,000. "
-        "Your real portfolio's normalized line uses its "
-        "first recorded valuation as a baseline. "
-        "Cash flows and portfolio changes are not adjusted."
-    )
-
-    st.subheader("Strategy Leaderboard")
-
-    if not snapshots.empty:
-        latest = (
-            snapshots.sort_values("run_date")
-            .groupby("strategy")
-            .tail(1)
-            .copy()
-        )
-
-        latest["return_pct"] = (
-            latest["equity"] / lab.STARTING_CASH - 1
-        ) * 100
-
-        st.dataframe(
-            latest[
-                ["strategy", "run_date", "equity",
-                 "cash", "return_pct"]
-            ].sort_values(
-                "return_pct", ascending=False
-            ),
-            hide_index=True,
-            use_container_width=True
+    if snapshots.empty:
+        st.info(
+            "No original AI strategy snapshots yet."
         )
     else:
-        st.info("No strategy snapshots recorded yet.")
-
-    st.divider()
-    st.subheader("Individual Strategy Explorer")
-
-    chosen = st.selectbox(
-        "Select a model", list(lab.MODELS)
-    )
-
-    config = lab.MODELS[chosen]
-
-    st.write("**Investment objective:**", config["description"])
-    st.write("**Selection methodology:**", config["method"])
-    st.write("**Investment universe:**", ", ".join(config["tickers"]))
-
-    model_snapshots = (
-        snapshots[
-            snapshots["strategy"] == chosen
-        ].sort_values("run_date")
-        if not snapshots.empty
-        else pd.DataFrame()
-    )
-
-    if not model_snapshots.empty:
-        latest = model_snapshots.iloc[-1]
+        snapshots = snapshots.sort_values("run_date")
+        latest = snapshots.iloc[-1]
 
         a, b, c = st.columns(3)
 
-        a.metric("Portfolio Value", f"${latest['equity']:,.2f}")
-        b.metric("Cash", f"${latest['cash']:,.2f}")
+        a.metric(
+            "AI Strategy",
+            f"${float(latest['equity']):,.2f}"
+        )
+
+        b.metric(
+            "VOO Benchmark",
+            f"${float(latest['benchmark_voo']):,.2f}"
+        )
+
         c.metric(
-            "Total Return",
-            f"{(latest['equity']/lab.STARTING_CASH-1)*100:+.2f}%"
+            "QQQ Benchmark",
+            f"${float(latest['benchmark_qqq']):,.2f}"
         )
 
-        positions = json.loads(latest["positions_json"])
+        chart = snapshots.set_index("run_date")[
+            ["equity", "benchmark_voo", "benchmark_qqq"]
+        ]
 
-        st.subheader("Current Positions")
+        st.line_chart(chart)
 
-        if positions:
-            st.dataframe(
-                pd.DataFrame([
-                    {"Ticker": ticker, "Shares": shares}
-                    for ticker, shares in positions.items()
-                ]),
-                hide_index=True,
-                use_container_width=True
-            )
-        else:
-            st.info("No current positions.")
-
-    model_trades = (
-        trades[
-            trades["strategy"] == chosen
-        ].sort_values("executed_at", ascending=False)
-        if not trades.empty
-        else pd.DataFrame()
+    st.info(
+        "The original AI strategy and the additional "
+        "Strategy Lab models are separate simulated "
+        "investment experiments."
     )
-
-    st.subheader("Recent Transactions and Explanations")
-
-    if model_trades.empty:
-        st.info("No trades recorded for this model.")
-    else:
-        st.dataframe(
-            model_trades,
-            hide_index=True,
-            use_container_width=True
-        )
-
-        for _, trade in model_trades.head(8).iterrows():
-            with st.expander(
-                f"{trade['trade_date']} — "
-                f"{trade['side']} {trade['ticker']}"
-            ):
-                st.write("**Why this trade was selected:**")
-                st.write(trade["reason"])
-                st.write(
-                    f"Shares: {float(trade['shares']):.5f}"
-                )
-                st.write(
-                    f"Price: ${float(trade['price']):,.2f}"
-                )
-                st.write(
-                    f"Simulated fee: ${float(trade['fee']):,.2f}"
-                )
-
-    st.divider()
-    st.subheader("All Strategy Transactions")
-
-    if not trades.empty:
-        st.dataframe(
-            trades.sort_values(
-                "executed_at", ascending=False
-            ),
-            hide_index=True,
-            use_container_width=True
-        )
-
-        st.download_button(
-            "Export All Trades",
-            trades.to_csv(index=False),
-            "all_strategy_trades.csv",
-            "text/csv"
-        )
-    else:
-        st.info("No trades yet.")
 
 
 # ============================================================
-# RESEARCH — FIXED HISTORICAL COMPARISON
+# RESEARCH
 # ============================================================
 
 elif page == "Research":
 
-    st.header("📊 Investment Research & Comparison")
+    st.header("🔬 Investment Research")
 
     st.write(
-        "Compare historical performance using a fixed "
-        "lookback period. Turning My Portfolio on or off "
-        "will not change the individual stocks' baselines."
+        "Compare stocks, ETFs, your personal portfolio, "
+        "and the original AI strategy using historical data."
     )
 
-    if "research_options" not in st.session_state:
-        st.session_state.research_options = [
+    if "research_symbols" not in st.session_state:
+        st.session_state.research_symbols = [
             "NVDA", "AAPL", "MSFT", "VOO", "QQQ"
         ]
 
     new_ticker = st.text_input(
-        "Add stock, ETF, or crypto ticker",
+        "Add a stock, ETF or cryptocurrency",
         placeholder="PLTR, TSLA, BTC-USD"
     )
 
     if st.button("Add ticker"):
-        ticker = new_ticker.upper().strip()
+        ticker = new_ticker.strip().upper()
 
-        if ticker and ticker not in st.session_state.research_options:
-            st.session_state.research_options.append(ticker)
+        if (
+            ticker
+            and ticker not in st.session_state.research_symbols
+        ):
+            st.session_state.research_symbols.append(ticker)
             st.rerun()
 
     available = list(dict.fromkeys(
-        st.session_state.research_options + list(WATCH)
+        st.session_state.research_symbols
+        + list(WATCH)
     ))
 
-    selected_tickers = st.multiselect(
-        "Choose investments",
-        available,
-        default=[
-            t for t in st.session_state.research_options
-            if t in available
-        ]
+    selected = st.multiselect(
+        "Stocks and ETFs to compare",
+        options=available,
+        default=st.session_state.research_symbols
     )
 
+    st.session_state.research_symbols = selected
+
     period = st.selectbox(
-        "Historical comparison period",
+        "Historical period",
         ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
         index=3
     )
 
-    c1, c2 = st.columns(2)
+    a, b = st.columns(2)
 
-    with c1:
-        show_portfolio = st.checkbox(
-            "My Portfolio ($10K)", value=True
+    with a:
+        show_personal = st.checkbox(
+            "My Portfolio ($10K)",
+            value=True
         )
 
-    with c2:
-        show_original = st.checkbox(
-            "Original AI Strategy", value=True
+    with b:
+        show_ai = st.checkbox(
+            "Original AI Strategy",
+            value=True
         )
-
-    # --------------------------------------------------------
-    # IMPORTANT FIX:
-    # Individual stocks are downloaded and normalized
-    # independently of the personal portfolio.
-    #
-    # No portfolio dates are used to reset their baselines.
-    # --------------------------------------------------------
 
     fig = go.Figure()
-    performance_rows = []
+    results = []
 
-    with st.spinner("Loading historical stock prices..."):
-        stock_history, missing_stocks = fetch_market_history(
-            selected_tickers, period
-        )
+    # ------------------------------------------
+    # INDIVIDUAL STOCKS
+    # ------------------------------------------
 
-    if missing_stocks:
-        st.warning(
-            "Unavailable market data: "
-            + ", ".join(missing_stocks)
-        )
+    for ticker in selected:
 
-    # Establish a stable reference window from the
-    # selected stocks only, not the personal portfolio.
-    if not stock_history.empty:
-        reference_start = stock_history.index.min()
-        reference_end = stock_history.index.max()
-    else:
-        reference_start = None
-        reference_end = None
-
-    # Each stock uses its own first valid observation
-    # within the selected historical lookback.
-    # Adding another chart line cannot alter its return.
-    for ticker in selected_tickers:
-        if ticker not in stock_history.columns:
-            continue
-
-        series = stock_history[ticker].dropna()
-        normalized = normalize_to_10000(series)
-
-        if normalized.empty:
-            continue
-
-        add_line(fig, normalized, ticker, width=2)
-
-        performance_rows.append({
-            "Investment": ticker,
-            "Start Date": normalized.index[0].date(),
-            "End Date": normalized.index[-1].date(),
-            "Starting Value": 10000.0,
-            "Ending Value": float(normalized.iloc[-1]),
-            "Return (%)": (
-                float(normalized.iloc[-1]) / 10000 - 1
-            ) * 100
-        })
-
-    # --------------------------------------------------------
-    # PERSONAL PORTFOLIO:
-    # Added separately, without modifying stock histories.
-    # --------------------------------------------------------
-
-    weights = {}
-    actual_value = 0.0
-
-    if show_portfolio:
         try:
-            weights, actual_value, missing = (
-                get_portfolio_weights()
+            history = get_history(ticker, period)
+            series = normalized(history)
+
+            if series.empty:
+                st.warning(
+                    f"No usable historical data for {ticker}."
+                )
+                continue
+
+            add_line(
+                fig,
+                series,
+                ticker,
+                width=2
             )
 
-            if missing:
-                if missing == ["No holdings saved yet."]:
-                    st.warning(
-                        "No holdings saved yet. Upload your "
-                        "CSV on the My Portfolio page."
-                    )
-                else:
-                    st.warning(
-                        "Cannot calculate the complete personal "
-                        "portfolio. Missing data: "
-                        + ", ".join(missing)
-                    )
-
-            elif weights:
-                portfolio_history, missing_history = (
-                    fetch_market_history(list(weights), period)
-                )
-
-                if missing_history:
-                    st.warning(
-                        "Missing historical portfolio prices: "
-                        + ", ".join(missing_history)
-                    )
-                else:
-                    simulated = simulate_personal_portfolio(
-                        portfolio_history, weights
-                    )
-
-                    if simulated.empty:
-                        st.warning(
-                            "Not enough overlapping historical "
-                            "data for your portfolio."
-                        )
-                    else:
-                        add_line(
-                            fig,
-                            simulated,
-                            "My Portfolio ($10K)",
-                            color="#F59E0B",
-                            width=5
-                        )
-
-                        performance_rows.append({
-                            "Investment": "My Portfolio ($10K)",
-                            "Start Date": simulated.index[0].date(),
-                            "End Date": simulated.index[-1].date(),
-                            "Starting Value": 10000.0,
-                            "Ending Value": float(simulated.iloc[-1]),
-                            "Return (%)": (
-                                float(simulated.iloc[-1]) /
-                                10000 - 1
-                            ) * 100
-                        })
-
-                        if reference_start is not None:
-                            if simulated.index[0] > reference_start:
-                                st.info(
-                                    "Your personal portfolio begins on "
-                                    f"{simulated.index[0].date()} because "
-                                    "not all holdings have earlier usable "
-                                    "prices. Individual stock lines keep "
-                                    "their original starting dates."
-                                )
+            results.append({
+                "Investment": ticker,
+                "Start Date": series.index[0].date(),
+                "End Date": series.index[-1].date(),
+                "Ending Value ($)": float(series.iloc[-1]),
+                "Return (%)": (
+                    float(series.iloc[-1]) / 10000 - 1
+                ) * 100
+            })
 
         except Exception as exc:
             st.warning(
-                "Personal portfolio simulation unavailable: "
-                + str(exc)[:200]
+                f"{ticker}: {type(exc).__name__}"
             )
 
-    # --------------------------------------------------------
-    # ORIGINAL AI STRATEGY:
-    # Uses its own saved equity history, not a fabricated
-    # year of returns.
-    # --------------------------------------------------------
+    # ------------------------------------------
+    # PERSONAL PORTFOLIO — FULL PERIOD
+    # ------------------------------------------
 
-    if show_original:
+    if show_personal:
+
         try:
-            original = read(engine, "snapshots")
+            weights, actual_value, missing = (
+                portfolio_weights()
+            )
 
-            if not original.empty:
-                original = original.sort_values("run_date")
+            if not weights:
+                st.warning(
+                    "No priced portfolio holdings available. "
+                    "Upload your holdings on My Portfolio."
+                )
 
-                ai_series = pd.Series(
-                    original["equity"].astype(float).values,
-                    index=pd.to_datetime(
-                        original["run_date"]
+            else:
+                simulation, historical_missing = (
+                    simulate_portfolio_full_period(
+                        weights, period
                     )
                 )
 
-                if ai_series.index.tz is not None:
-                    ai_series.index = (
-                        ai_series.index.tz_localize(None)
+                if not simulation.empty:
+
+                    add_line(
+                        fig,
+                        simulation,
+                        "My Portfolio ($10K)",
+                        color="#F59E0B",
+                        width=5
                     )
 
-                if reference_start is not None:
-                    ai_series = ai_series.loc[
-                        (ai_series.index >= reference_start)
-                        & (ai_series.index <= reference_end)
-                    ]
+                    results.append({
+                        "Investment": "My Portfolio ($10K)",
+                        "Start Date": simulation.index[0].date(),
+                        "End Date": simulation.index[-1].date(),
+                        "Ending Value ($)": float(
+                            simulation.iloc[-1]
+                        ),
+                        "Return (%)": (
+                            float(simulation.iloc[-1])
+                            / 10000 - 1
+                        ) * 100
+                    })
+
+                if missing:
+                    st.warning(
+                        "These saved holdings could not be "
+                        "priced and are excluded from the "
+                        "allocation: "
+                        + ", ".join(missing)
+                    )
+
+                if historical_missing:
+                    st.info(
+                        "These holdings remained in cash "
+                        "because historical prices were "
+                        "unavailable: "
+                        + ", ".join(historical_missing)
+                    )
+
+        except Exception as exc:
+            st.error(
+                "Portfolio simulation error: "
+                + str(exc)[:250]
+            )
+
+    # ------------------------------------------
+    # ORIGINAL AI STRATEGY
+    # ------------------------------------------
+
+    if show_ai:
+
+        try:
+            snapshots = read(engine, "snapshots")
+
+            if not snapshots.empty:
+
+                snapshots = snapshots.sort_values(
+                    "run_date"
+                )
+
+                series = pd.Series(
+                    snapshots["equity"].astype(float).values,
+                    index=pd.to_datetime(
+                        snapshots["run_date"]
+                    )
+                )
 
                 add_line(
                     fig,
-                    ai_series,
+                    series,
                     "Original AI Strategy",
                     color="#A855F7",
                     width=4,
                     dash="dash"
                 )
 
-        except Exception as exc:
+        except Exception:
             st.warning(
-                "Original AI Strategy data unavailable: "
-                + type(exc).__name__
+                "Original AI strategy snapshots unavailable."
             )
 
-    style_chart(
+    format_chart(
         fig,
         "Growth of $10,000 — Research Comparison"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        "Each individual stock is normalized using its "
-        "own historical price data for the selected period. "
-        "My Portfolio is a separate historical buy-and-hold "
-        "simulation using your current allocation. "
-        "Click a legend name to hide or show its line."
+    st.plotly_chart(
+        fig,
+        use_container_width=True
     )
 
-    # --------------------------------------------------------
-    # ALLOCATION
-    # --------------------------------------------------------
+    st.caption(
+        "Each individual stock is independently normalized "
+        "to $10,000. The orange line uses current personal "
+        "portfolio weights and holds allocations in cash "
+        "until their historical securities become available. "
+        "The purple line shows recorded original strategy "
+        "equity, not a reconstructed backtest."
+    )
 
-    if show_portfolio and weights:
-        st.divider()
-        st.subheader("💼 My Portfolio — $10,000 Allocation")
+    # ------------------------------------------
+    # RESULTS
+    # ------------------------------------------
 
-        allocation = pd.DataFrame([
-            {
-                "Ticker": ticker,
-                "Weight (%)": weight * 100,
-                "Hypothetical Investment ($)": weight * 10000
-            }
-            for ticker, weight in weights.items()
-        ]).sort_values(
-            "Weight (%)", ascending=False
-        )
+    st.subheader("Historical Performance")
 
-        st.dataframe(
-            allocation,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Weight (%)": st.column_config.NumberColumn(
-                    "Weight (%)", format="%.2f%%"
-                ),
-                "Hypothetical Investment ($)":
-                    st.column_config.NumberColumn(
-                        "Hypothetical Investment ($)",
-                        format="$%.2f"
-                    )
-            }
-        )
+    if results:
 
-        st.metric(
-            "Current Actual Portfolio Value",
-            f"${actual_value:,.2f}"
-        )
-
-    # --------------------------------------------------------
-    # PERFORMANCE TABLE
-    # --------------------------------------------------------
-
-    st.divider()
-    st.subheader("📊 Historical Performance")
-
-    if performance_rows:
-        table = pd.DataFrame(performance_rows)
-        table = table.sort_values(
-            "Return (%)", ascending=False
+        table = pd.DataFrame(results).sort_values(
+            "Return (%)",
+            ascending=False
         )
 
         st.dataframe(
             table,
             hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Starting Value": st.column_config.NumberColumn(
-                    "Starting Value", format="$%.2f"
-                ),
-                "Ending Value": st.column_config.NumberColumn(
-                    "Ending Value", format="$%.2f"
-                ),
-                "Return (%)": st.column_config.NumberColumn(
-                    "Return (%)", format="%.2f%%"
-                )
-            }
+            use_container_width=True
         )
 
         st.caption(
-            "Compare Start Date and End Date before "
-            "ranking investments. Different available "
-            "histories mean different measurement periods."
+            "Compare starting and ending dates before "
+            "ranking returns. Securities may have "
+            "different historical coverage."
         )
-    else:
-        st.info("Select investments to display performance.")
 
-    # --------------------------------------------------------
-    # EXPLANATIONS
-    # --------------------------------------------------------
+    # ------------------------------------------
+    # PERSONAL ALLOCATION
+    # ------------------------------------------
+
+    if show_personal:
+
+        try:
+            weights, actual_value, missing = (
+                portfolio_weights()
+            )
+
+            if weights:
+
+                st.subheader(
+                    "My Portfolio — $10,000 Allocation"
+                )
+
+                allocation = pd.DataFrame([
+                    {
+                        "Ticker": ticker,
+                        "Weight (%)": weight * 100,
+                        "Starting Allocation ($)": weight * 10000
+                    }
+                    for ticker, weight in weights.items()
+                ])
+
+                st.dataframe(
+                    allocation.sort_values(
+                        "Weight (%)",
+                        ascending=False
+                    ),
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                st.metric(
+                    "Current Priced Portfolio Value",
+                    f"${actual_value:,.2f}"
+                )
+
+        except Exception:
+            pass
 
     with st.expander(
-        "📚 How the chart works and why it is accurate",
+        "📚 How the historical simulation works",
         expanded=True
     ):
+
         st.markdown("""
-### 1. Historical stock prices
+### Why your orange line now goes back farther
 
-The app downloads historical adjusted prices
-for each selected investment.
+Previously, your portfolio waited until every
+holding had historical price data.
 
-Adjusted prices account for stock splits and,
-when supplied by the data provider, dividends.
+The new method begins at the earliest available
+date in the requested period.
 
-### 2. The $10,000 comparison
+### How $10,000 is invested
 
-Each investment begins at a hypothetical $10,000.
+Your current portfolio allocation determines
+the initial investment assigned to each holding.
 
-For example, if a stock gains 20% during its
-selected historical period:
+For example:
 
-**$10,000 becomes $12,000.**
+- 50% NVDA = $5,000
+- 30% VOO = $3,000
+- 20% PLTR = $2,000
 
-### 3. Fixed historical comparison logic
+### What happens to newer stocks?
 
-Enabling your personal portfolio does not alter
-the start date or historical return of MSFT,
-NVDA, AAPL, VOO, QQQ, or any other stock.
+If an investment does not have historical prices
+at the beginning of the period, its allocation
+remains in cash.
 
-Individual stock data is processed independently.
+When its first historical price becomes available,
+the simulation purchases hypothetical shares.
 
-### 4. Your personal portfolio
+Those shares are held afterward.
 
-The app retrieves your saved holdings, calculates
-their current percentage weights, and applies
-those weights to a hypothetical $10,000 investment.
+### Why this matters
 
-It purchases hypothetical shares at the first
-common historical date for all your holdings.
+The orange portfolio line can now extend back
+to the selected historical period without
+fabricating stock prices.
 
-Those shares are then held without rebalancing.
+### Important assumptions
 
-### 5. Why your portfolio may start later
-
-Some holdings may have a shorter price history.
-
-Rather than silently changing the starting dates
-of all other investments, the app displays your
-personal portfolio over its available period.
-
-### 6. Original AI Strategy
-
-The original AI Strategy line uses saved paper
-trading snapshots. It does not invent earlier
-performance data.
-
-### 7. Important limitations
-
-- Historical data depends on the market-data provider.
-- Different start dates make return rankings less comparable.
-- Your current weights are applied retroactively.
-- Your real historical trades are not reconstructed.
-- The portfolio simulation excludes trading fees and taxes.
-- The portfolio simulation is not a brokerage performance statement.
-- Past performance does not predict future results.
+- Current portfolio weights are used retroactively.
+- Missing historical prices are not invented.
+- Unavailable investments are initially held as cash.
+- There are no simulated taxes or trading fees.
+- No rebalancing occurs after the initial purchases.
+- The model does not recreate your actual trades.
+- Cash is assumed to earn zero interest.
+- Historical results do not predict future returns.
 """)
 
 
 # ============================================================
-# ORIGINAL AI STRATEGY
+# STRATEGY LAB
 # ============================================================
 
-elif page == "Original AI Strategy":
+elif page == "Strategy Lab":
 
-    st.header("🤖 Original AI Strategy")
+    st.header("🏦 Multi-Strategy Investment Lab")
 
-    snapshots = read(engine, "snapshots")
+    st.caption(
+        "Goldman Sachs, JPMorgan Chase and Pelosi-inspired "
+        "strategies are independent approximations, "
+        "not actual institutional or congressional portfolios."
+    )
 
-    if snapshots.empty:
-        st.info("No original strategy snapshots yet.")
-    else:
-        snapshots = snapshots.sort_values("run_date")
+    if st.button(
+        "Run All Paper Strategies",
+        type="primary"
+    ):
+        try:
+            messages = lab.run_daily(engine)
 
-        st.line_chart(
-            snapshots.set_index("run_date")[
-                ["equity", "benchmark_voo", "benchmark_qqq"]
-            ]
+            st.success(
+                "Paper strategy update completed."
+            )
+
+            for message in messages:
+                st.write(message)
+
+        except Exception as exc:
+            st.error(
+                "Strategy run failed: "
+                + str(exc)[:200]
+            )
+
+    @st.fragment(run_every="60s")
+    def strategy_dashboard():
+
+        snapshots = lab.data(
+            engine, "lab_snapshots"
         )
 
-        st.dataframe(
-            snapshots,
-            hide_index=True,
-            use_container_width=True
+        trades = lab.data(
+            engine, "lab_trades"
         )
 
-    with st.expander("How this strategy works"):
+        positions = lab.data(
+            engine, "lab_positions"
+        )
+
+        accounts = lab.data(
+            engine, "lab_models"
+        )
+
+        st.subheader("Strategy Performance Comparison")
+
+        if not snapshots.empty:
+
+            comparison = snapshots.copy()
+
+            comparison["day"] = pd.to_datetime(
+                comparison["day"]
+            )
+
+            comparison = comparison.sort_values("day")
+
+            comparison["Normalized $10K"] = (
+                comparison.groupby("model")["equity"]
+                .transform(
+                    lambda s: (
+                        s / s.iloc[0] * 10000
+                        if s.iloc[0] > 0
+                        else np.nan
+                    )
+                )
+            )
+
+            chart = px.line(
+                comparison,
+                x="day",
+                y="Normalized $10K",
+                color="model",
+                markers=True,
+                title="AI Investment Strategies — Growth of $10,000"
+            )
+
+            chart.update_layout(
+                height=550,
+                hovermode="x unified"
+            )
+
+            st.plotly_chart(
+                chart,
+                use_container_width=True
+            )
+
+            latest = (
+                snapshots.sort_values("day")
+                .drop_duplicates("model", keep="last")
+                .copy()
+            )
+
+            st.subheader("Strategy Leaderboard")
+
+            latest["Return (%)"] = (
+                latest["equity"] / lab.START - 1
+            ) * 100
+
+            st.dataframe(
+                latest[
+                    ["model", "day", "equity", "cash", "Return (%)"]
+                ],
+                hide_index=True,
+                use_container_width=True
+            )
+
+        else:
+            st.info(
+                "No saved strategy snapshots yet."
+            )
+
+        st.subheader("Daily Transactions")
+
+        if not trades.empty:
+
+            st.dataframe(
+                trades.sort_values(
+                    "executed_at",
+                    ascending=False
+                ),
+                hide_index=True,
+                use_container_width=True
+            )
+
+            st.download_button(
+                "Download Transactions",
+                trades.to_csv(index=False),
+                "strategy_trades.csv",
+                "text/csv"
+            )
+
+        else:
+            st.info(
+                "No simulated transactions yet."
+            )
+
+        st.subheader("Individual Strategy Explorer")
+
+        chosen = st.selectbox(
+            "Select investment strategy",
+            list(lab.MODELS)
+        )
+
         st.write(
-            "The original rules-based model evaluates "
-            "momentum, price trends, and volatility, "
-            "then records simulated investment decisions. "
-            "VOO and QQQ are comparison benchmarks."
+            "**Strategy objective:**",
+            lab.MODELS[chosen]
         )
+
+        if not positions.empty:
+
+            selected_positions = positions[
+                positions["model"] == chosen
+            ]
+
+            st.write("**Current Positions**")
+
+            st.dataframe(
+                selected_positions,
+                hide_index=True,
+                use_container_width=True
+            )
+
+        if not trades.empty:
+
+            selected_trades = trades[
+                trades["model"] == chosen
+            ].sort_values(
+                "executed_at",
+                ascending=False
+            )
+
+            st.write("**Recent Trades and Reasoning**")
+
+            st.dataframe(
+                selected_trades,
+                hide_index=True,
+                use_container_width=True
+            )
+
+            for row in selected_trades.head(5).itertuples():
+
+                with st.expander(
+                    f"{row.side} {row.ticker}"
+                ):
+
+                    st.write(
+                        "**Recorded reason:**",
+                        row.reason
+                    )
+
+                    st.write(
+                        f"Shares: {row.shares:.5f}"
+                    )
+
+                    st.write(
+                        f"Price: ${row.price:,.2f}"
+                    )
+
+        st.caption(
+            "This page refreshes its database tables "
+            "approximately every 60 seconds while open. "
+            "New trades require a completed strategy run."
+        )
+
+    strategy_dashboard()
 
 
 # ============================================================
@@ -1184,7 +1039,7 @@ elif page == "Original AI Strategy":
 
 elif page == "Daily Decisions":
 
-    st.header("📅 Original AI Daily Decisions")
+    st.header("📅 Original AI Strategy Decisions")
 
     try:
         signals = score_frame(prices(WATCH))
@@ -1196,29 +1051,35 @@ elif page == "Daily Decisions":
         )
 
         if st.button("Run Original AI Strategy"):
+
             result = run(engine)
-            st.success("Original strategy run completed.")
+
+            st.success(
+                "Original AI Strategy updated."
+            )
+
             st.write(result)
 
     except Exception as exc:
+
         st.error(
-            "Could not calculate signals: "
+            "Unable to calculate daily decisions: "
             + type(exc).__name__
         )
 
 
 # ============================================================
-# ORIGINAL TRADE LOG
+# TRADE LOG
 # ============================================================
 
 elif page == "Trade Log":
 
-    st.header("📋 Original AI Strategy Trade Log")
+    st.header("📋 Original AI Trade Log")
 
     trades = read(engine, "trades")
 
     if trades.empty:
-        st.info("No original strategy trades recorded.")
+        st.info("No recorded trades.")
     else:
         st.dataframe(
             trades,
@@ -1227,7 +1088,7 @@ elif page == "Trade Log":
         )
 
         st.download_button(
-            "Export Original Trades",
+            "Download Original Trades",
             trades.to_csv(index=False),
             "original_trades.csv",
             "text/csv"
@@ -1243,16 +1104,17 @@ elif page == "My Portfolio":
     st.header("💼 My Actual Portfolio")
 
     st.write(
-        "Upload your holdings and save them to Supabase. "
-        "Required CSV columns: ticker, shares. "
-        "Optional column: cost_basis."
+        "Upload a CSV containing ticker and shares. "
+        "An optional cost_basis column is supported."
     )
 
     uploaded = st.file_uploader(
-        "Upload holdings CSV", type="csv"
+        "Upload holdings CSV",
+        type="csv"
     )
 
     if uploaded is not None:
+
         try:
             frame = pd.read_csv(uploaded)
 
@@ -1262,23 +1124,28 @@ elif page == "My Portfolio":
 
             if not {"ticker", "shares"}.issubset(frame.columns):
                 st.error(
-                    "CSV must contain ticker and shares columns."
+                    "CSV must contain ticker and shares."
                 )
             else:
+
                 frame["ticker"] = (
-                    frame["ticker"].astype(str)
-                    .str.upper().str.strip()
+                    frame["ticker"]
+                    .astype(str)
+                    .str.upper()
+                    .str.strip()
                 )
 
                 frame["shares"] = pd.to_numeric(
-                    frame["shares"], errors="coerce"
+                    frame["shares"],
+                    errors="coerce"
                 )
 
                 if "cost_basis" not in frame.columns:
                     frame["cost_basis"] = np.nan
 
                 frame["cost_basis"] = pd.to_numeric(
-                    frame["cost_basis"], errors="coerce"
+                    frame["cost_basis"],
+                    errors="coerce"
                 )
 
                 frame = frame.dropna(
@@ -1292,7 +1159,8 @@ elif page == "My Portfolio":
                 ]
 
                 frame = frame.groupby(
-                    "ticker", as_index=False
+                    "ticker",
+                    as_index=False
                 ).agg({
                     "shares": "sum",
                     "cost_basis": "mean"
@@ -1304,78 +1172,76 @@ elif page == "My Portfolio":
                     use_container_width=True
                 )
 
-                if not 1 <= len(frame) <= 100:
-                    st.error(
-                        "Upload between 1 and 100 valid holdings."
-                    )
-                elif st.button(
+                if st.button(
                     "Save / Replace My Holdings",
                     type="primary"
                 ):
-                    save_holdings(frame)
-                    st.success("Holdings saved in Supabase.")
-                    st.rerun()
+
+                    if not 1 <= len(frame) <= 100:
+                        st.error(
+                            "Provide 1–100 valid holdings."
+                        )
+                    else:
+                        save_holdings(frame)
+
+                        st.success(
+                            "Holdings saved in Supabase."
+                        )
+
+                        st.rerun()
 
         except Exception as exc:
             st.error(
-                "CSV processing error: " + str(exc)[:200]
-            )
-
-    saved = personal_holdings()
-
-    if saved.empty:
-        st.info("No holdings saved yet.")
-    else:
-        st.subheader("Saved Holdings")
-
-        try:
-            valued, missing, total = (
-                value_actual_portfolio(record=True)
-            )
-
-            st.metric(
-                "Priced Market Value",
-                f"${total:,.2f}"
-            )
-
-            st.dataframe(
-                valued,
-                hide_index=True,
-                use_container_width=True
-            )
-
-            if missing:
-                st.warning(
-                    "Missing prices: " + ", ".join(missing)
-                )
-                st.caption(
-                    "The total is incomplete. No complete "
-                    "daily valuation was saved."
-                )
-            else:
-                chart = px.pie(
-                    valued,
-                    names="ticker",
-                    values="market_value",
-                    hole=0.4,
-                    title="Current Portfolio Allocation"
-                )
-                st.plotly_chart(
-                    chart, use_container_width=True
-                )
-
-            st.subheader("Saved Daily Valuations")
-
-            st.dataframe(
-                personal_snapshots(),
-                hide_index=True,
-                use_container_width=True
-            )
-
-        except Exception as exc:
-            st.error(
-                "Portfolio valuation error: "
+                "CSV processing error: "
                 + str(exc)[:200]
+            )
+
+    frame = load_holdings()
+
+    if frame.empty:
+        st.info("No saved holdings.")
+    else:
+
+        weights, total, missing = portfolio_weights()
+
+        st.metric(
+            "Priced Portfolio Value",
+            f"${total:,.2f}"
+        )
+
+        st.dataframe(
+            frame,
+            hide_index=True,
+            use_container_width=True
+        )
+
+        if missing:
+            st.warning(
+                "Unpriced holdings: "
+                + ", ".join(missing)
+            )
+
+        if weights:
+
+            allocation = pd.DataFrame([
+                {
+                    "Ticker": ticker,
+                    "Market Value": weight * total
+                }
+                for ticker, weight in weights.items()
+            ])
+
+            fig = px.pie(
+                allocation,
+                names="Ticker",
+                values="Market Value",
+                hole=0.4,
+                title="Current Portfolio Allocation"
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True
             )
 
 
@@ -1385,82 +1251,55 @@ elif page == "My Portfolio":
 
 else:
 
-    st.header("📚 Investment Strategy Methodology")
+    st.header("📚 Methodology")
+
+    for name, description in lab.MODELS.items():
+        st.markdown(
+            f"### {name}\n{description}"
+        )
 
     st.markdown("""
-## AI Goldman Sachs
+### Market Data
 
-A quality and lower-volatility factor approximation.
+Historical adjusted prices are retrieved from
+Yahoo Finance.
 
-It evaluates securities using trend, momentum,
-and volatility-based rules.
+### Investment Signals
 
-It is not affiliated with Goldman Sachs.
+The original model uses price trends, moving
+averages, momentum, and volatility.
 
-## AI Pelosi Disclosure-Inspired
+### Simulated Transactions
 
-A predefined technology-heavy investment basket.
+All paper trades are simulated.
 
-It does not follow live congressional disclosures
-or reproduce Nancy Pelosi's actual transactions.
+No real brokerage orders are placed.
 
-## AI JPMorgan Chase
+### Historical Portfolio Comparison
 
-A diversified multi-asset investment approximation.
+Your personal portfolio is simulated using
+current allocation weights applied retroactively.
 
-It combines exposure to different asset classes.
+If a security lacks historical prices at the
+start of the selected period, its allocation
+remains in cash until that security becomes
+available.
 
-It is not JPMorgan Chase's proprietary strategy.
+### Automatic Updates
 
-## AI Momentum
+GitHub Actions can run the paper strategies
+on a schedule when configured correctly.
 
-Selects investments using recent momentum and
-moving-average trend filters.
+The Streamlit interface itself does not run
+scheduled jobs while the application is asleep.
 
-## AI Defensive Income
+### Important Limitations
 
-Focuses on defensive and income-oriented assets.
-
-## AI Equal-Weight Growth
-
-Uses a predefined basket of growth companies
-with equal-weight allocation rules.
-
-## Key Financial Concepts
-
-**Momentum:** How much an investment's price
-has changed over a recent period.
-
-**Moving average:** A smoothed average of
-historical prices.
-
-**Volatility:** How widely investment returns vary.
-
-**Rebalancing:** Adjusting investments to restore
-target allocations.
-
-**Drawdown:** The decline from a previous peak.
-
-**Benchmark:** A reference investment used to
-evaluate performance.
-
-## Daily Updates
-
-The six Strategy Lab models can run through
-GitHub Actions on weekdays after market close.
-
-Successful results are stored in Supabase.
-
-The original AI Strategy has a separate run process.
-
-## Important Limitations
-
-- All model trades are simulated.
-- No real brokerage orders are placed.
-- Models are rules-based, not autonomous AI agents.
-- Missed historical trades are not reconstructed.
-- Market holidays are not explicitly handled.
-- Transaction fees and execution are simplified.
-- Personal holdings require manual updates.
-- Historical performance does not guarantee future returns.
+- Models are rules-based rather than autonomous AI.
+- Institutional-inspired strategies are approximations.
+- Historical results do not guarantee future returns.
+- Prices may be delayed or revised.
+- No actual historical personal trades are reconstructed.
+- Trading fees and taxes are simplified or excluded.
+- Cash is assumed to earn no interest in the backtest.
 """)
