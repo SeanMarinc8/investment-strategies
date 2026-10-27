@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import json
@@ -854,9 +853,7 @@ elif page == "Strategy Lab":
     @st.fragment(run_every="60s")
     def strategy_dashboard():
 
-        snapshots = lab.data(
-            engine, "lab_snapshots"
-        )
+        snapshots = lab.data(engine, "lab_snapshots")
 
         trades = lab.data(
             engine, "lab_trades"
