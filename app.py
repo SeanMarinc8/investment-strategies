@@ -1,4 +1,13 @@
-        elif include_ai and not sn.empty:
+import os
+import hmac
+import logging
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+
+
+elif include_ai and not sn.empty:
             st.info('AI Strategy points represent recorded virtual equity, not historical price-based backtesting. The line may be short or absent for a selected period.')
 
     st.subheader('What the research data means')
