@@ -660,6 +660,7 @@ page = st.sidebar.radio(
     "Navigation",
     [
         "Dashboard",
+        "Daily Performance",
         "Research",
         "Strategy Lab",
         "Daily Decisions",
@@ -729,6 +730,227 @@ if page == "Dashboard":
         "Strategy Lab tracks six independently "
         "simulated investment models."
     )
+
+
+# ============================================================
+# DAILY PERFORMANCE DASHBOARD
+# ============================================================
+
+elif page == "Daily Performance":
+
+    st.header("📈 Daily Strategy Performance")
+    st.write(
+        "Daily results from actual saved paper-trading snapshots, "
+        "with adjusted-price ETF benchmarks. No hypothetical "
+        "daily returns are inserted when data is missing."
+    )
+
+    _, snapshots = lab_tables()
+
+    if snapshots.empty:
+        st.info(
+            "No saved strategy valuations yet. Your scheduled GitHub "
+            "Action must complete a database-writing run before "
+            "performance can appear here."
+        )
+    elif not {"strategy", "run_date", "equity", "cash"}.issubset(snapshots.columns):
+        st.error("The lab_snapshots table is missing required columns.")
+    else:
+        snapshots = snapshots.copy()
+        snapshots["run_date"] = pd.to_datetime(
+            snapshots["run_date"], errors="coerce"
+        ).dt.normalize()
+        snapshots["equity"] = pd.to_numeric(
+            snapshots["equity"], errors="coerce"
+        )
+        snapshots["cash"] = pd.to_numeric(
+            snapshots["cash"], errors="coerce"
+        )
+        snapshots = snapshots.dropna(
+            subset=["strategy", "run_date", "equity"]
+        )
+        snapshots = snapshots[snapshots["equity"] > 0]
+        snapshots = snapshots.sort_values("run_date").drop_duplicates(
+            ["strategy", "run_date"], keep="last"
+        )
+
+        if snapshots.empty:
+            st.warning("No valid positive-equity strategy snapshots found.")
+        else:
+            latest_date = snapshots["run_date"].max()
+            first_date = snapshots["run_date"].min()
+            st.caption(
+                f"Recorded data: {first_date:%b %d, %Y} through "
+                f"{latest_date:%b %d, %Y}. Dates are snapshot dates, "
+                "not necessarily the latest completed trading session."
+            )
+
+            leaderboard = []
+            history_by_strategy = {}
+            for name in lab.MODELS:
+                rows = snapshots[snapshots["strategy"] == name].sort_values("run_date")
+                if rows.empty:
+                    leaderboard.append({
+                        "Strategy": name, "Last Updated": "Never",
+                        "Portfolio Value ($)": None, "Daily P&L ($)": None,
+                        "Daily Return (%)": None, "Total Return (%)": None,
+                        "Cash ($)": None, "Snapshots": 0,
+                    })
+                    continue
+
+                values = pd.Series(
+                    rows["equity"].to_numpy(dtype=float),
+                    index=pd.DatetimeIndex(rows["run_date"]),
+                    name=name,
+                )
+                history_by_strategy[name] = values
+                current = float(values.iloc[-1])
+                prior = float(values.iloc[-2]) if len(values) >= 2 else None
+                daily_pnl = current - prior if prior is not None else None
+                daily_pct = (current / prior - 1) * 100 if prior and prior > 0 else None
+                leaderboard.append({
+                    "Strategy": name,
+                    "Last Updated": values.index[-1].strftime("%Y-%m-%d"),
+                    "Portfolio Value ($)": current,
+                    "Daily P&L ($)": daily_pnl,
+                    "Daily Return (%)": daily_pct,
+                    "Total Return (%)": (current / lab.STARTING_CASH - 1) * 100,
+                    "Cash ($)": float(rows.iloc[-1]["cash"]),
+                    "Snapshots": len(values),
+                })
+
+            board = pd.DataFrame(leaderboard)
+            active = board[board["Snapshots"] > 0].copy()
+            current_day = board[board["Last Updated"] == latest_date.strftime("%Y-%m-%d")]
+            with_daily = active.dropna(subset=["Daily Return (%)"])
+
+            a, b, c, d = st.columns(4)
+            a.metric("Models With Data", f"{len(active)} / {len(lab.MODELS)}")
+            b.metric("Updated on Latest Date", f"{len(current_day)} / {len(lab.MODELS)}")
+            c.metric("Recorded Trading Dates", str(snapshots["run_date"].nunique()))
+            if not with_daily.empty:
+                best = with_daily.sort_values("Daily Return (%)", ascending=False).iloc[0]
+                d.metric("Best Latest Daily Return", f"{best['Daily Return (%)']:+.2f}%")
+            else:
+                d.metric("Best Latest Daily Return", "Not available")
+
+            st.subheader("Daily Strategy Leaderboard")
+            st.dataframe(
+                board.sort_values("Total Return (%)", ascending=False, na_position="last"),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "Portfolio Value ($)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Daily P&L ($)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Daily Return (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Total Return (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Cash ($)": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+            st.caption(
+                "Daily P&L and return compare the two most recent saved "
+                "snapshots for each model, which may be more than one "
+                "calendar day apart. A blank value means only one "
+                "snapshot exists. Total return is measured from the "
+                "model's original $10,000 starting capital."
+            )
+
+            if len(current_day) < len(lab.MODELS):
+                st.warning(
+                    "Not every model has a valuation on the latest "
+                    "recorded date. Check your GitHub Actions run logs "
+                    "if an update is missing."
+                )
+
+            st.subheader("Strategy Equity Curves")
+            equity_fig = go.Figure()
+            for name, values in history_by_strategy.items():
+                add_line(equity_fig, values, name, width=3)
+            format_chart(equity_fig, "Saved Paper-Trading Equity", "Portfolio Equity ($)")
+            st.plotly_chart(equity_fig, use_container_width=True)
+
+            st.subheader("Apples-to-Apples: Strategies vs VOO and QQQ")
+            st.write(
+                "All lines below are rebased to $10,000 at the "
+                "same common observation date. This chart compares "
+                "returns during the recorded overlap only."
+            )
+
+            if len(history_by_strategy) < 2:
+                st.info("More strategies need saved valuations for a comparison.")
+            else:
+                common_dates = None
+                for values in history_by_strategy.values():
+                    days = set(values.index)
+                    common_dates = days if common_dates is None else common_dates & days
+                common_dates = sorted(common_dates or [])
+
+                if not common_dates:
+                    st.info("The strategies do not yet share a common snapshot date.")
+                else:
+                    comparison_fig = go.Figure()
+                    start = common_dates[0]
+                    end = common_dates[-1]
+                    for name, values in history_by_strategy.items():
+                        matched = values.reindex(common_dates).dropna()
+                        if not matched.empty:
+                            rebased = matched / float(matched.iloc[0]) * 10000
+                            add_line(comparison_fig, rebased, name, width=2)
+
+                    benchmark_results = []
+                    for symbol, color in [("VOO", "#16A34A"), ("QQQ", "#EA580C")]:
+                        try:
+                            bench = get_history(symbol, "1y")
+                            # Use the first available price on or after the
+                            # common starting date; never use a future price
+                            # to represent an earlier benchmark date.
+                            bench = bench.loc[(bench.index >= start) & (bench.index <= end)]
+                            if not bench.empty:
+                                normalized = bench / float(bench.iloc[0]) * 10000
+                                add_line(comparison_fig, normalized, symbol, color=color, width=4, dash="dash")
+                                benchmark_results.append({
+                                    "Benchmark": symbol,
+                                    "Start": bench.index[0].date(),
+                                    "End": bench.index[-1].date(),
+                                    "Return (%)": (float(normalized.iloc[-1]) / 10000 - 1) * 100,
+                                })
+                            else:
+                                st.info(f"No {symbol} prices available in the common comparison window.")
+                        except Exception as exc:
+                            st.warning(f"Could not load {symbol}: {type(exc).__name__}")
+
+                    format_chart(comparison_fig, "Common-Date Growth of $10,000")
+                    st.plotly_chart(comparison_fig, use_container_width=True)
+                    st.caption(
+                        f"Common strategy snapshot dates: {start:%Y-%m-%d} "
+                        f"through {end:%Y-%m-%d} ({len(common_dates)} observations). "
+                        "ETF benchmarks use available adjusted closes in this "
+                        "window; their precise starting date may differ if "
+                        "market data is unavailable on the first snapshot date. "
+                        "A one-date chart cannot show a performance trend."
+                    )
+                    if benchmark_results:
+                        st.dataframe(pd.DataFrame(benchmark_results), hide_index=True, use_container_width=True)
+
+            st.subheader("Latest Recorded Trades")
+            trades = load_lab_table("lab_trades")
+            if trades.empty:
+                st.info("No simulated trades recorded yet.")
+            else:
+                order_col = "executed_at" if "executed_at" in trades else "trade_date"
+                recent = trades.sort_values(order_col, ascending=False).head(30)
+                visible = [
+                    c for c in ["strategy", "trade_date", "ticker", "side", "shares", "price", "fee", "reason"]
+                    if c in recent.columns
+                ]
+                st.dataframe(recent[visible], hide_index=True, use_container_width=True)
+
+            st.caption(
+                "Paper-trading results are educational simulations, not "
+                "live brokerage performance. The initial purchase fee "
+                "may make first-day equity slightly below $10,000. "
+                "Adjusted ETF prices are sourced from Yahoo Finance "
+                "and may be delayed or revised."
+            )
 
 
 # ============================================================
@@ -1721,6 +1943,13 @@ actual Goldman Sachs or JPMorgan Chase portfolios.
 
 The Pelosi-inspired model does not reproduce
 actual congressional transactions.
+
+## Daily Performance
+
+The Daily Performance page reads saved `lab_snapshots` and `lab_trades`
+and compares overlapping strategy dates with Yahoo Finance VOO/QQQ prices.
+Daily return is based on consecutive recorded snapshots, not necessarily
+consecutive market days. No missing historical returns are fabricated.
 
 ## Strategy Updates
 
