@@ -712,53 +712,362 @@ st.sidebar.caption(
 # ============================================================
 
 if page == "Dashboard":
+    st.header("📊 Investment Command Center")
+    st.caption(
+        "Your paper-trading strategies, personal portfolio and "
+        "market benchmarks in one place."
+    )
 
-    st.header("📊 Investment Dashboard")
+    daily = safe_read("snapshots")
+    _, strategy_daily = lab_tables()
+    intraday = load_intraday_snapshots()
 
-    snapshots = safe_read("snapshots")
+    if not intraday.empty:
+        intraday = intraday.copy()
+        intraday["observed_at"] = pd.to_datetime(
+            intraday["observed_at"],
+            utc=True,
+            errors="coerce"
+        )
+        intraday["equity"] = pd.to_numeric(
+            intraday["equity"],
+            errors="coerce"
+        )
+        intraday = intraday.dropna(
+            subset=["observed_at", "equity", "strategy"]
+        ).sort_values("observed_at")
 
-    if snapshots.empty:
+    # Dashboard summary
+    original_value = None
+
+    if not daily.empty and "equity" in daily:
+        daily = daily.copy()
+        daily["run_date"] = pd.to_datetime(
+            daily["run_date"],
+            errors="coerce"
+        )
+        daily = daily.sort_values("run_date")
+        original_value = float(daily.iloc[-1]["equity"])
+
+    latest = (
+        intraday.groupby("strategy").tail(1)
+        if not intraday.empty
+        else pd.DataFrame()
+    )
+
+    active = (
+        int(latest["strategy"].isin(list(lab.MODELS)).sum())
+        if not latest.empty
+        else 0
+    )
+
+    personal = (
+        latest[latest["strategy"] == "My Weighted Portfolio"]
+        if not latest.empty
+        else pd.DataFrame()
+    )
+
+    personal_value = (
+        float(personal.iloc[-1]["equity"])
+        if not personal.empty
+        else None
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Original AI Portfolio",
+        f"${original_value:,.2f}"
+        if original_value is not None else "No data"
+    )
+
+    c2.metric(
+        "Active AI Strategies",
+        f"{active} / {len(lab.MODELS)}"
+    )
+
+    c3.metric(
+        "My Weighted Portfolio",
+        f"${personal_value:,.2f}"
+        if personal_value is not None else "No data"
+    )
+
+    if not intraday.empty:
+        last_update = intraday["observed_at"].max()
+        c4.metric(
+            "Last Market Update",
+            last_update.tz_convert(ET).strftime(
+                "%b %d, %I:%M %p ET"
+            )
+        )
+    else:
+        c4.metric("Last Market Update", "No data")
+
+    st.divider()
+
+    # Main portfolio performance graph
+    st.subheader("📈 Portfolio Performance Comparison")
+
+    st.caption(
+        "All portfolios are normalized to $10,000 at their "
+        "first displayed observation for comparison."
+    )
+
+    if not intraday.empty:
+        period = st.selectbox(
+            "Performance Period",
+            [
+                "Latest session",
+                "Last 5 trading days",
+                "All recorded"
+            ],
+            index=1
+        )
+
+        local_dates = (
+            intraday["observed_at"]
+            .dt.tz_convert(ET)
+            .dt.date
+        )
+
+        available_dates = sorted(local_dates.unique())
+
+        if period == "Latest session":
+            chart_data = intraday[
+                local_dates == available_dates[-1]
+            ].copy()
+
+        elif period == "Last 5 trading days":
+            chart_data = intraday[
+                local_dates.isin(available_dates[-5:])
+            ].copy()
+
+        else:
+            chart_data = intraday.copy()
+
+        fig = go.Figure()
+
+        strategies = list(lab.MODELS) + [
+            "My Weighted Portfolio"
+        ]
+
+        for strategy in strategies:
+            series = chart_data[
+                chart_data["strategy"] == strategy
+            ].sort_values("observed_at")
+
+            if series.empty:
+                continue
+
+            starting_value = float(
+                series.iloc[0]["equity"]
+            )
+
+            if starting_value <= 0:
+                continue
+
+            normalized = (
+                series["equity"] / starting_value
+            ) * 10000
+
+            line_style = (
+                dict(color="#FF8C00", width=4)
+                if strategy == "My Weighted Portfolio"
+                else {}
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=series["observed_at"].dt.tz_convert(ET),
+                    y=normalized,
+                    mode="lines+markers",
+                    name=strategy,
+                    line=line_style
+                )
+            )
+
+        # Add VOO and QQQ benchmarks
+        benchmark = (
+            chart_data.sort_values("observed_at")
+            .drop_duplicates("observed_at")
+        )
+
+        for ticker, column in [
+            ("VOO", "voo_price"),
+            ("QQQ", "qqq_price")
+        ]:
+            if column not in benchmark.columns:
+                continue
+
+            prices = benchmark.copy()
+            prices[column] = pd.to_numeric(
+                prices[column],
+                errors="coerce"
+            )
+
+            prices = prices.dropna(subset=[column])
+            prices = prices[prices[column] > 0]
+
+            if prices.empty:
+                continue
+
+            normalized = (
+                prices[column] /
+                float(prices.iloc[0][column])
+            ) * 10000
+
+            fig.add_trace(
+                go.Scatter(
+                    x=prices["observed_at"].dt.tz_convert(ET),
+                    y=normalized,
+                    mode="lines+markers",
+                    name=ticker,
+                    line=dict(dash="dash", width=2)
+                )
+            )
+
+        fig.update_layout(
+            height=520,
+            hovermode="x unified",
+            xaxis_title="Eastern Time",
+            yaxis_title="Normalized Portfolio Value ($)",
+            legend=dict(
+                orientation="h",
+                y=-0.25
+            )
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+        if chart_data["observed_at"].nunique() == 1:
+            st.info(
+                "Only one intraday observation exists. "
+                "The graph will develop as updates accumulate."
+            )
+
+    else:
         st.info(
-            "No original AI strategy snapshots yet."
+            "Waiting for the first intraday portfolio "
+            "valuations from GitHub Actions."
+        )
+
+    st.divider()
+
+    # Latest strategy leaderboard
+    st.subheader("🏆 Strategy Leaderboard")
+
+    if not latest.empty:
+        leaderboard = latest[
+            latest["strategy"].isin(
+                list(lab.MODELS) +
+                ["My Weighted Portfolio"]
+            )
+        ].copy()
+
+        leaderboard = leaderboard.rename(
+            columns={
+                "strategy": "Strategy",
+                "equity": "Portfolio Value ($)"
+            }
+        )
+
+        leaderboard["Last Updated"] = (
+            leaderboard["observed_at"]
+            .dt.tz_convert(ET)
+            .dt.strftime("%b %d, %I:%M %p")
+        )
+
+        leaderboard = leaderboard[
+            [
+                "Strategy",
+                "Portfolio Value ($)",
+                "Last Updated"
+            ]
+        ]
+
+        st.dataframe(
+            leaderboard,
+            hide_index=True,
+            use_container_width=True
+        )
+
+        st.caption(
+            "Actual personal portfolio dollar values may "
+            "not be comparable to $10,000 paper accounts."
         )
 
     else:
-        snapshots = snapshots.sort_values(
-            "run_date"
+        st.info(
+            "The leaderboard will appear after "
+            "intraday valuations are recorded."
         )
 
-        latest = snapshots.iloc[-1]
+    st.divider()
 
-        a, b, c = st.columns(3)
+    # Original strategy daily performance
+    st.subheader("📅 Original AI Strategy — Daily History")
 
-        a.metric(
-            "Original AI Portfolio",
-            f"${float(latest['equity']):,.2f}"
+    required = [
+        "run_date",
+        "equity",
+        "benchmark_voo",
+        "benchmark_qqq"
+    ]
+
+    if (
+        not daily.empty
+        and all(col in daily.columns for col in required)
+    ):
+        history = daily.copy()
+        history["run_date"] = pd.to_datetime(
+            history["run_date"],
+            errors="coerce"
         )
 
-        b.metric(
-            "VOO Benchmark",
-            f"${float(latest['benchmark_voo']):,.2f}"
+        history = history.sort_values("run_date")
+
+        history_fig = go.Figure()
+
+        for column, name in [
+            ("equity", "Original AI Portfolio"),
+            ("benchmark_voo", "VOO"),
+            ("benchmark_qqq", "QQQ")
+        ]:
+            history_fig.add_trace(
+                go.Scatter(
+                    x=history["run_date"],
+                    y=pd.to_numeric(
+                        history[column],
+                        errors="coerce"
+                    ),
+                    mode="lines+markers",
+                    name=name
+                )
+            )
+
+        history_fig.update_layout(
+            height=350,
+            hovermode="x unified",
+            yaxis_title="Portfolio Value ($)"
         )
 
-        c.metric(
-            "QQQ Benchmark",
-            f"${float(latest['benchmark_qqq']):,.2f}"
+        st.plotly_chart(
+            history_fig,
+            use_container_width=True
         )
 
-        chart = snapshots.set_index("run_date")[
-            ["equity", "benchmark_voo", "benchmark_qqq"]
-        ]
+    else:
+        st.info(
+            "Daily performance history is not yet available."
+        )
 
-        st.line_chart(chart)
-
-    st.info(
-        "Research compares historical prices. "
-        "Strategy Lab tracks six independently "
-        "simulated investment models."
+    st.caption(
+        "Educational paper trading only. "
+        "Market quotes may be delayed."
     )
-
-
 
 # ============================================================
 # LIVE STRATEGY MONITOR: BACKGROUND-SAVED HISTORY
