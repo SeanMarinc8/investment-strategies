@@ -652,6 +652,32 @@ def run_missing_strategies():
     return pd.DataFrame(results)
 
 
+
+# ============================================================
+# INTRADAY MONITOR (READ-ONLY)
+# ============================================================
+
+def load_intraday_snapshots():
+    """Load background-recorded intraday valuations without triggering trades."""
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text(
+                "SELECT to_regclass('public.lab_intraday_snapshots')"
+            )).scalar()
+        if not exists:
+            return pd.DataFrame()
+        return pd.read_sql_query(
+            text("""SELECT strategy, observed_at, equity, cash, voo_price,
+                           qqq_price, price_asof, missing_tickers
+                    FROM lab_intraday_snapshots
+                    ORDER BY observed_at"""),
+            engine,
+        )
+    except Exception as exc:
+        st.warning(f"Intraday history could not be loaded: {type(exc).__name__}: {exc}")
+        return pd.DataFrame()
+
+
 # ============================================================
 # NAVIGATION
 # ============================================================
@@ -661,6 +687,7 @@ page = st.sidebar.radio(
     [
         "Dashboard",
         "Daily Performance",
+        "Live Strategy Monitor",
         "Research",
         "Strategy Lab",
         "Daily Decisions",
@@ -730,6 +757,142 @@ if page == "Dashboard":
         "Strategy Lab tracks six independently "
         "simulated investment models."
     )
+
+
+
+# ============================================================
+# LIVE STRATEGY MONITOR: BACKGROUND-SAVED HISTORY
+# ============================================================
+
+elif page == "Live Strategy Monitor":
+    st.header("📡 Live Strategy Monitor")
+    st.write(
+        "Automatically recorded intraday paper-portfolio valuations. "
+        "The GitHub Actions collector runs in the cloud even while this site is closed."
+    )
+    st.caption(
+        "Near-live, not exchange-certified real-time quotes. Data can be delayed; "
+        "GitHub's scheduled jobs can be late or skipped. No trades occur here."
+    )
+
+    history = load_intraday_snapshots()
+    if history.empty:
+        st.info(
+            "No intraday data yet. Commit intraday_runner.py and the new GitHub "
+            "Actions workflow, then wait for a successful market-hours run."
+        )
+    else:
+        history = history.copy()
+        history["observed_at"] = pd.to_datetime(history["observed_at"], utc=True, errors="coerce")
+        history["price_asof"] = pd.to_datetime(history["price_asof"], utc=True, errors="coerce")
+        for col in ["equity", "cash", "voo_price", "qqq_price"]:
+            history[col] = pd.to_numeric(history[col], errors="coerce")
+        history = history.dropna(subset=["strategy", "observed_at", "equity"])
+        history = history.sort_values("observed_at").drop_duplicates(
+            ["strategy", "observed_at"], keep="last"
+        )
+
+        if history.empty:
+            st.info("No valid intraday observations yet.")
+        else:
+            available_dates = sorted(history["observed_at"].dt.tz_convert(ET).dt.date.unique())
+            window = st.selectbox(
+                "Time range", ["Latest session", "Last 5 trading days", "All recorded"],
+                index=1,
+            )
+            if window == "Latest session":
+                day = available_dates[-1]
+                shown = history[history["observed_at"].dt.tz_convert(ET).dt.date == day].copy()
+            elif window == "Last 5 trading days":
+                days = set(available_dates[-5:])
+                shown = history[history["observed_at"].dt.tz_convert(ET).dt.date.isin(days)].copy()
+            else:
+                shown = history.copy()
+
+            latest_time = history["observed_at"].max()
+            last_price = history["price_asof"].max()
+            st.caption(
+                f"Last saved observation: {latest_time.tz_convert(ET):%b %d, %Y %I:%M %p} ET"
+                + (f" | Latest quote timestamp: {last_price.tz_convert(ET):%b %d %I:%M %p} ET"
+                   if pd.notna(last_price) else "")
+            )
+            current = history.sort_values("observed_at").groupby("strategy").tail(1)
+            previous = history.sort_values("observed_at").groupby("strategy").tail(2)
+            previous_values = {}
+            for name, rows in previous.groupby("strategy"):
+                rows = rows.sort_values("observed_at")
+                if len(rows) > 1:
+                    previous_values[name] = float(rows.iloc[-2]["equity"])
+
+            board = []
+            for name in lab.MODELS:
+                rows = current[current["strategy"] == name]
+                if rows.empty:
+                    board.append({"Strategy": name, "Value ($)": None, "Change since last sample (%)": None, "Last sample (ET)": "No data"})
+                    continue
+                row = rows.iloc[-1]
+                value = float(row["equity"])
+                prior = previous_values.get(name)
+                board.append({
+                    "Strategy": name,
+                    "Value ($)": value,
+                    "Change since last sample (%)": ((value / prior - 1) * 100 if prior and prior > 0 else None),
+                    "Last sample (ET)": row["observed_at"].tz_convert(ET).strftime("%b %d %I:%M %p"),
+                })
+            st.subheader("Latest Strategy Values")
+            st.dataframe(
+                pd.DataFrame(board), hide_index=True, use_container_width=True,
+                column_config={
+                    "Value ($)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Change since last sample (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                },
+            )
+
+            st.subheader("Intraday Equity — Six Strategies")
+            fig = go.Figure()
+            for name in lab.MODELS:
+                rows = shown[shown["strategy"] == name].sort_values("observed_at")
+                if not rows.empty:
+                    fig.add_trace(go.Scatter(
+                        x=rows["observed_at"].dt.tz_convert(ET),
+                        y=rows["equity"],
+                        mode="lines+markers", name=name,
+                    ))
+            fig.update_layout(height=540, hovermode="x unified", yaxis_title="Portfolio value ($)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Same-Period Returns vs VOO and QQQ")
+            st.caption(
+                "All series begin at 0% at their first displayed observation. "
+                "This compares recorded price changes, not annualized returns."
+            )
+            comparison = go.Figure()
+            for name in lab.MODELS:
+                rows = shown[shown["strategy"] == name].sort_values("observed_at")
+                if not rows.empty and rows["equity"].iloc[0] > 0:
+                    comparison.add_trace(go.Scatter(
+                        x=rows["observed_at"].dt.tz_convert(ET),
+                        y=(rows["equity"] / rows["equity"].iloc[0] - 1) * 100,
+                        mode="lines", name=name,
+                    ))
+            benchmark = shown.sort_values("observed_at").drop_duplicates("observed_at")
+            for symbol, field in [("VOO", "voo_price"), ("QQQ", "qqq_price")]:
+                b = benchmark.dropna(subset=[field])
+                b = b[b[field] > 0]
+                if not b.empty:
+                    comparison.add_trace(go.Scatter(
+                        x=b["observed_at"].dt.tz_convert(ET),
+                        y=(b[field] / b[field].iloc[0] - 1) * 100,
+                        mode="lines", name=symbol, line=dict(dash="dash", width=3),
+                    ))
+            comparison.update_layout(height=540, hovermode="x unified", yaxis_title="Return since first shown observation (%)")
+            st.plotly_chart(comparison, use_container_width=True)
+
+            st.caption(
+                "Intraday values use the most recent saved holdings and cash plus sampled "
+                "market quotes. Daily Strategy Lab snapshots remain separate. "
+                "Historical chart lines do not update unless the collector writes new rows."
+            )
 
 
 # ============================================================
