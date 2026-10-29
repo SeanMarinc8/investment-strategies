@@ -1,0 +1,41 @@
+
+name: Intraday Strategy Monitor
+
+on:
+  schedule:
+    # Run every 15 minutes on weekdays.
+    # Python checks actual Eastern market hours.
+    - cron: '*/15 13-21 * * 1-5'
+
+  # Allows you to run it manually from GitHub Actions
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-strategy-monitor
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Record intraday strategy valuations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python intraday_runner.py
