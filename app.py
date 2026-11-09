@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 
 import strategy_lab as lab
 from engine import db, init, read, run, prices, score_frame, WATCH, START_CASH
@@ -29,7 +29,7 @@ st.set_page_config(
 
 st.title("📈 AI Investment Research Lab")
 st.caption(
-    "Historical investment research • Six paper-trading models • "
+    "Historical investment research • Six investment models + intraday bot • "
     "Personal portfolio • No real brokerage trading"
 )
 
@@ -175,7 +175,7 @@ def add_line(
         x=series.index,
         y=series.values,
         name=name,
-        mode="lines",
+        mode="lines+markers",
         line=line,
         connectgaps=False,
         hovertemplate=(
@@ -679,6 +679,64 @@ def load_intraday_snapshots():
 
 
 # ============================================================
+# SEVENTH MODEL: INTRADAY BOT (READ-ONLY)
+# ============================================================
+
+INTRADAY_BOT_NAME = "AI Intraday Trader"
+ALL_STRATEGY_NAMES = list(lab.MODELS) + [INTRADAY_BOT_NAME]
+
+
+def safe_bot_table(table_name):
+    """Read only known bot tables; never execute trades from Streamlit."""
+    allowed = {
+        "lab_snapshots", "lab_trades", "lab_intraday_snapshots",
+        "intraday_snapshots", "intraday_trades", "intraday_positions",
+        "intraday_signals", "intraday_decisions", "intraday_bot_snapshots",
+        "intraday_bot_trades", "day_trades", "day_trading_snapshots",
+    }
+    if table_name not in allowed:
+        return pd.DataFrame()
+    try:
+        if not inspect(engine).has_table(table_name):
+            return pd.DataFrame()
+        return pd.read_sql_query(text(f'SELECT * FROM "{table_name}"'), engine)
+    except Exception:
+        return pd.DataFrame()
+
+
+def bot_rows(frame):
+    if frame.empty:
+        return frame
+    for column in ("strategy", "model", "bot_name"):
+        if column in frame.columns:
+            return frame[frame[column].astype(str).str.casefold() == INTRADAY_BOT_NAME.casefold()].copy()
+    return frame.copy()
+
+
+def bot_time_column(frame):
+    for column in ("executed_at", "observed_at", "timestamp", "trade_time", "created_at", "run_date", "trade_date", "snapshot_date", "date"):
+        if column in frame.columns:
+            return column
+    return None
+
+
+def show_bot_history(frame, title, limit=100):
+    st.subheader(title)
+    if frame.empty:
+        st.info("No saved records found in this table yet.")
+        return
+    time_col = bot_time_column(frame)
+    if time_col:
+        frame = frame.sort_values(time_col, ascending=False)
+    st.dataframe(frame.head(limit), hide_index=True, use_container_width=True)
+    st.download_button(
+        f"Download {title} CSV", frame.to_csv(index=False),
+        file_name=title.lower().replace(" ", "_") + ".csv",
+        mime="text/csv", key="download_" + title.lower().replace(" ", "_")
+    )
+
+
+# ============================================================
 # NAVIGATION
 # ============================================================
 
@@ -688,6 +746,7 @@ page = st.sidebar.radio(
         "Dashboard",
         "Daily Performance",
         "Live Strategy Monitor",
+        "AI Intraday Trader",
         "Research",
         "Strategy Lab",
         "Daily Decisions",
@@ -1006,6 +1065,18 @@ if page == "Dashboard":
         )
 
     st.divider()
+    st.subheader("⚡ Seventh Strategy — AI Intraday Trader")
+    bot_daily = bot_rows(safe_bot_table("lab_snapshots"))
+    bot_trades = bot_rows(safe_bot_table("lab_trades"))
+    bot_dedicated = safe_bot_table("intraday_trades")
+    if not bot_daily.empty and "equity" in bot_daily.columns:
+        last_bot = bot_daily.sort_values(bot_time_column(bot_daily) or "equity").iloc[-1]
+        st.metric("Latest Saved Bot Equity", f"${float(last_bot['equity']):,.2f}")
+    else:
+        st.info("No saved intraday bot equity detected yet. The after-hours workflow correctly skipped trading; a successful market-hours run is still needed.")
+    st.caption("Bot trade records detected: " + str(len(bot_trades) + len(bot_dedicated)) + ". Open AI Intraday Trader for details. These are simulated trades only.")
+
+    st.divider()
 
     # Original strategy daily performance
     st.subheader("📅 Original AI Strategy — Daily History")
@@ -1072,6 +1143,67 @@ if page == "Dashboard":
 # ============================================================
 # LIVE STRATEGY MONITOR: BACKGROUND-SAVED HISTORY
 # ============================================================
+
+elif page == "AI Intraday Trader":
+    st.header("⚡ AI Intraday Trader")
+    st.caption("Seventh independent paper-trading model • Read-only monitoring • No brokerage orders")
+    st.info("The intraday workflow runs separately from your six after-close strategies. A green GitHub Actions check means the script exited successfully, not necessarily that it traded. Outside market hours it is expected to skip.")
+
+    bot_snapshot = bot_rows(safe_bot_table("lab_snapshots"))
+    bot_trades = bot_rows(safe_bot_table("lab_trades"))
+    dedicated_snapshots = [
+        (name, safe_bot_table(name)) for name in (
+            "intraday_snapshots", "intraday_bot_snapshots", "day_trading_snapshots"
+        )
+    ]
+    dedicated_trades = [
+        (name, safe_bot_table(name)) for name in (
+            "intraday_trades", "intraday_bot_trades", "day_trades"
+        )
+    ]
+    dedicated_signals = [
+        (name, safe_bot_table(name)) for name in (
+            "intraday_signals", "intraday_decisions", "intraday_positions"
+        )
+    ]
+
+    snapshot_sources = [("lab_snapshots", bot_snapshot)] + dedicated_snapshots
+    trade_sources = [("lab_trades", bot_trades)] + dedicated_trades
+    all_snapshots = [(name, df) for name, df in snapshot_sources if not df.empty]
+    all_trades = [(name, df) for name, df in trade_sources if not df.empty]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Snapshot Sources", str(len(all_snapshots)))
+    c2.metric("Saved Trade Records", str(sum(len(df) for _, df in all_trades)))
+    c3.metric("Status", "Records available" if all_snapshots or all_trades else "Awaiting data")
+
+    if not all_snapshots and not all_trades:
+        st.warning("No bot-specific records were found in the recognized database tables. This can be normal before the first market-hours run, or the bot may use different table names. Check the GitHub Actions log for a market-hours run and its saved trade/snapshot messages.")
+
+    for source, frame in all_snapshots:
+        st.subheader(f"Equity History — {source}")
+        tcol = bot_time_column(frame)
+        vcol = next((c for c in ("equity", "portfolio_value", "market_value", "account_value") if c in frame.columns), None)
+        if tcol and vcol:
+            plot_df = frame.copy()
+            plot_df[tcol] = pd.to_datetime(plot_df[tcol], errors="coerce", utc=True)
+            plot_df[vcol] = pd.to_numeric(plot_df[vcol], errors="coerce")
+            plot_df = plot_df.dropna(subset=[tcol, vcol]).sort_values(tcol)
+            if not plot_df.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=plot_df[tcol].dt.tz_convert(ET), y=plot_df[vcol], mode="lines+markers", name=INTRADAY_BOT_NAME))
+                fig.update_layout(height=380, xaxis_title="Eastern Time", yaxis_title="Paper Equity ($)")
+                st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(frame.sort_values(tcol, ascending=False).head(100) if tcol else frame.head(100), hide_index=True, use_container_width=True)
+
+    for source, frame in all_trades:
+        show_bot_history(frame, f"Bot Trades — {source}")
+    for source, frame in dedicated_signals:
+        if not frame.empty:
+            show_bot_history(frame, f"Bot Signals — {source}")
+
+    st.caption("This page never calls the trading engine. Data is displayed only when the bot has actually persisted it to Supabase. It does not fabricate trades, signals, or P&L.")
+
 
 elif page == "Live Strategy Monitor":
     st.header("📡 Live Strategy Monitor")
@@ -1259,7 +1391,7 @@ elif page == "Daily Performance":
 
             leaderboard = []
             history_by_strategy = {}
-            for name in lab.MODELS:
+            for name in ALL_STRATEGY_NAMES:
                 rows = snapshots[snapshots["strategy"] == name].sort_values("run_date")
                 if rows.empty:
                     leaderboard.append({
@@ -1297,8 +1429,8 @@ elif page == "Daily Performance":
             with_daily = active.dropna(subset=["Daily Return (%)"])
 
             a, b, c, d = st.columns(4)
-            a.metric("Models With Data", f"{len(active)} / {len(lab.MODELS)}")
-            b.metric("Updated on Latest Date", f"{len(current_day)} / {len(lab.MODELS)}")
+            a.metric("Models With Data", f"{len(active)} / {len(ALL_STRATEGY_NAMES)}")
+            b.metric("Updated on Latest Date", f"{len(current_day)} / {len(ALL_STRATEGY_NAMES)}")
             c.metric("Recorded Trading Dates", str(snapshots["run_date"].nunique()))
             if not with_daily.empty:
                 best = with_daily.sort_values("Daily Return (%)", ascending=False).iloc[0]
@@ -1326,7 +1458,7 @@ elif page == "Daily Performance":
                 "model's original $10,000 starting capital."
             )
 
-            if len(current_day) < len(lab.MODELS):
+            if len(current_day) < len(ALL_STRATEGY_NAMES):
                 st.warning(
                     "Not every model has a valuation on the latest "
                     "recorded date. Check your GitHub Actions run logs "
@@ -1779,7 +1911,7 @@ elif page == "Strategy Lab":
     st.header("🏦 Multi-Strategy Investment Lab")
 
     st.write(
-        "Six independent paper-trading models, "
+        "Six investment models plus a separate intraday paper bot, "
         "each with a $10,000 starting balance."
     )
 
@@ -2405,7 +2537,7 @@ stays in cash until its first available price.
 The model does not reconstruct actual historical
 personal trades.
 
-## Six Strategy Lab Models
+## Six Strategy Lab Models and a Separate Intraday Bot
 
 Each strategy starts with $10,000 and independently
 records simulated positions, trades and valuations.
@@ -2425,8 +2557,10 @@ consecutive market days. No missing historical returns are fabricated.
 
 ## Strategy Updates
 
-The six strategies use the existing
+The six after-close strategies use the existing
 `strategy_lab.run_strategy()` function.
+
+The intraday bot uses a separate workflow and only displays saved data here.
 
 GitHub Actions can execute scheduled updates
 when its workflow and database credentials
