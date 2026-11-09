@@ -1,5 +1,11 @@
 
-"""Scheduled paper-trading and real-portfolio valuation job."""
+"""Scheduled daily paper trading and personal portfolio valuation.
+
+Runs the six original strategies after the US market closes.
+The AI Intraday Trader runs separately through run_intraday().
+Existing Supabase positions and history are preserved.
+"""
+
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,18 +17,11 @@ from engine import db, init
 import strategy_lab as lab
 
 
-def main():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5 or (now.hour, now.minute) < (16, 20):
-        print("Not an eligible after-close weekday; skipping.")
-        return
+ET = ZoneInfo("America/New_York")
 
-    if not os.environ.get("DATABASE_URL"):
-        raise RuntimeError("DATABASE_URL GitHub Actions secret is missing.")
 
-    engine = db()
-    init(engine)
-    lab.initialize(engine)
+def ensure_personal_tables(engine):
+    """Create missing tables without deleting existing data."""
 
     with engine.begin() as conn:
         conn.execute(text("""
@@ -32,6 +31,7 @@ def main():
                 cost_basis DOUBLE PRECISION
             )
         """))
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS personal_snapshots (
                 snapshot_date DATE PRIMARY KEY,
@@ -41,45 +41,129 @@ def main():
             )
         """))
 
+
+def run_daily_strategies(engine, today):
+    """Run the six daily strategies, excluding the intraday bot."""
+
     snapshots = lab.load(engine, "lab_snapshots")
+
     completed = set()
+
     if not snapshots.empty:
-        completed = set(snapshots.loc[
-            pd.to_datetime(snapshots["run_date"]).dt.date == now.date(),
-            "strategy"
-        ])
+        dates = pd.to_datetime(
+            snapshots["run_date"],
+            errors="coerce"
+        ).dt.date
+
+        completed = set(
+            snapshots.loc[
+                dates == today,
+                "strategy"
+            ]
+        )
+
+    results = []
+    failures = []
 
     for name in lab.MODELS:
-        if name in completed:
-            print(name, "already completed today")
+
+        # Intraday trading has its own execution workflow.
+        if name == lab.DAY_BOT:
             continue
+
+        if name in completed:
+            print(f"SKIP: {name} already completed today")
+            continue
+
         try:
-            print(lab.run_strategy(engine, name))
+            result = lab.run_strategy(engine, name)
+
+            results.append(result)
+
+            print(
+                f"SUCCESS: {name} | "
+                f"Equity: ${result.get('equity', 0):,.2f} | "
+                f"Trades: {result.get('trades', 0)} | "
+                f"Reason: {result.get('reason', '')}"
+            )
+
         except Exception as exc:
-            print(name, "FAILED:", type(exc).__name__, str(exc)[:180])
+            message = (
+                f"{name}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            failures.append(message)
+
+            print(f"FAILED: {message}")
+
+    print()
+    print("DAILY STRATEGY SUMMARY")
+    print("----------------------")
+    print(f"Strategies processed: {len(results)}")
+    print(f"Strategies already completed: {len(completed & (set(lab.MODELS) - {lab.DAY_BOT}))}")
+    print(f"New paper trades: {sum(r.get('trades', 0) for r in results)}")
+    print(f"Strategy failures: {len(failures)}")
+
+    return failures
+
+
+def value_personal_holdings(engine, today):
+    """Record the personal portfolio's daily market value."""
 
     holdings = pd.read_sql_query(
-        text("SELECT ticker, shares FROM personal_holdings"),
+        text("""
+            SELECT ticker, shares
+            FROM personal_holdings
+            WHERE shares > 0
+        """),
         engine
     )
 
     if holdings.empty:
-        print("No personal holdings saved; skipping valuation.")
+        print(
+            "PERSONAL PORTFOLIO: "
+            "No positive-share holdings saved."
+        )
         return
 
-    history = lab.fetch_history(holdings["ticker"].tolist(), "1mo")
+    tickers = holdings["ticker"].tolist()
+
+    history = lab.fetch_history(
+        tickers,
+        "1mo"
+    )
+
+    if history.empty:
+        print(
+            "PERSONAL PORTFOLIO: "
+            "Market data unavailable; no snapshot saved."
+        )
+        return
+
     quotes = {}
 
-    for ticker in holdings["ticker"]:
-        if ticker in history.columns:
-            s = history[ticker].dropna()
-            if not s.empty and float(s.iloc[-1]) > 0:
-                quotes[ticker] = float(s.iloc[-1])
+    for ticker in tickers:
+        if ticker not in history.columns:
+            continue
 
-    if len(quotes) != len(holdings):
+        series = history[ticker].dropna()
+
+        if series.empty:
+            continue
+
+        price = float(series.iloc[-1])
+
+        if price > 0:
+            quotes[ticker] = price
+
+    missing = set(tickers) - set(quotes)
+
+    if missing:
         print(
-            "Missing prices; skipping incomplete personal snapshot:",
-            set(holdings["ticker"]) - set(quotes)
+            "PERSONAL PORTFOLIO: "
+            "Incomplete pricing; snapshot skipped.",
+            sorted(missing)
         )
         return
 
@@ -91,19 +175,84 @@ def main():
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO personal_snapshots
-            (snapshot_date, market_value, priced_count, missing_count)
+            (
+                snapshot_date,
+                market_value,
+                priced_count,
+                missing_count
+            )
             VALUES (:d, :v, :n, 0)
-            ON CONFLICT (snapshot_date) DO UPDATE SET
+
+            ON CONFLICT (snapshot_date)
+            DO UPDATE SET
                 market_value = EXCLUDED.market_value,
                 priced_count = EXCLUDED.priced_count,
                 missing_count = 0
         """), {
-            "d": now.date(),
+            "d": today,
             "v": value,
             "n": len(holdings)
         })
 
-    print("Personal holdings valuation:", round(value, 2))
+    print(
+        f"PERSONAL PORTFOLIO: "
+        f"${value:,.2f} | "
+        f"{len(holdings)} priced holdings"
+    )
+
+
+def main():
+
+    now = datetime.now(ET)
+    today = now.date()
+
+    print("=" * 60)
+    print("AI INVESTMENT RESEARCH LAB")
+    print("DAILY AUTOMATED STRATEGY UPDATE")
+    print("=" * 60)
+
+    print("Eastern Time:", now.isoformat())
+
+    if now.weekday() >= 5:
+        print("Weekend: daily trading skipped.")
+        return
+
+    if (now.hour, now.minute) < (16, 20):
+        print(
+            "Market-close processing starts "
+            "at 4:20 PM Eastern."
+        )
+        return
+
+    if not os.environ.get("DATABASE_URL"):
+        raise RuntimeError(
+            "DATABASE_URL GitHub Actions secret is missing."
+        )
+
+    engine = db()
+
+    init(engine)
+    lab.initialize(engine)
+    ensure_personal_tables(engine)
+
+    failures = run_daily_strategies(
+        engine,
+        today
+    )
+
+    value_personal_holdings(
+        engine,
+        today
+    )
+
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} daily strategies failed: "
+            + " | ".join(failures)
+        )
+
+    print()
+    print("Daily update finished successfully.")
 
 
 if __name__ == "__main__":
