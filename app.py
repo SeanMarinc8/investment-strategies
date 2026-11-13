@@ -1,7 +1,7 @@
 import os
 import hmac
 import json
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -148,7 +148,7 @@ def normalize(series):
     return series / series.iloc[0] * START
 
 
-def chart(lines, title, height=470):
+def chart(lines, title, height=470, x_start=None):
     fig = go.Figure()
     for i, (name, series) in enumerate(lines.items()):
         s = series.dropna().sort_index()
@@ -163,6 +163,8 @@ def chart(lines, title, height=470):
                       font=dict(color='#334155'), margin=dict(l=12, r=12, t=52, b=10),
                       hovermode='x unified', legend=dict(orientation='h', y=-0.18),
                       xaxis=dict(showgrid=False), yaxis=dict(gridcolor='#e2e8f0', tickprefix='$'))
+    if x_start is not None:
+        fig.update_xaxes(range=[pd.Timestamp(x_start), max(pd.Timestamp.now().normalize(), max((v.dropna().index.max() for v in lines.values() if not v.dropna().empty), default=pd.Timestamp.now().normalize()))])
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -454,61 +456,60 @@ elif page == 'My Portfolio':
         except Exception as exc:
             st.warning(f'Holdings valuation unavailable: {exc}')
     st.subheader('Personal portfolio history vs. paper strategies')
+    st.caption('Chart timeline begins June 1, 2026. Each paper strategy starts on its actual first recorded snapshot date; no earlier performance is invented.')
     custom_ticker = st.text_input(
-        'Add any stock or ETF ticker to the comparison',
-        placeholder='e.g. NVDA, AAPL, PFE, SPY',
-        help='Enter one Yahoo Finance ticker. It is only added to this chart, not to your holdings or trading bots.'
+        'Add a stock or ETF to this comparison',
+        placeholder='NVDA, AAPL, PFE, RUM, SPY',
+        help='Chart only: this does not change your holdings.'
     ).strip().upper()
-    chosen = st.multiselect('Compare my portfolio with', strategies,
+    chosen = st.multiselect('Compare with paper strategies', strategies,
                             default=strategies, key='personal_strategy_compare')
+    cutoff = pd.Timestamp('2026-06-01')
+    lines = {}
+    # Each strategy enters the graph on its actual first saved date, not a common start.
+    for name, series in strategy_series(snaps, chosen).items():
+        series = series.loc[series.index >= cutoff].dropna().sort_index()
+        if not series.empty:
+            lines[name] = normalize(series)
+
     personal = table('personal_snapshots')
-    lines = strategy_series(snaps, chosen)
     if not personal.empty and {'snapshot_date', 'market_value'}.issubset(personal.columns):
         personal['snapshot_date'] = pd.to_datetime(personal['snapshot_date'], errors='coerce').dt.normalize()
         personal['market_value'] = pd.to_numeric(personal['market_value'], errors='coerce')
         personal = personal.dropna(subset=['snapshot_date', 'market_value']).sort_values('snapshot_date')
+        personal = personal.loc[personal['snapshot_date'] >= cutoff]
         if not personal.empty:
-            lines['My Portfolio'] = pd.Series(personal['market_value'].values,
-                                              index=personal['snapshot_date'])
-    else:
-        st.caption('Personal history will appear after your workflow saves personal_snapshots.')
+            series = pd.Series(personal['market_value'].values, index=personal['snapshot_date'])
+            lines['My Portfolio'] = normalize(series)
+    if 'My Portfolio' not in lines:
+        st.caption('Your portfolio line starts when the first personal snapshot was actually saved. Earlier holdings history cannot be reconstructed accurately from current shares alone.')
+
+    symbols_to_compare = ['VOO', 'QQQ']
+    if custom_ticker:
+        if len(custom_ticker) > 16 or not all(c.isalnum() or c in '.-' for c in custom_ticker):
+            st.warning('Invalid ticker. Try NVDA, BRK-B, or RUM.')
+        elif custom_ticker not in symbols_to_compare:
+            symbols_to_compare.append(custom_ticker)
     try:
-        benchmark_symbols = ['VOO', 'QQQ']
-        if custom_ticker and custom_ticker not in benchmark_symbols:
-            if not all(ch.isalnum() or ch in '.-' for ch in custom_ticker) or len(custom_ticker) > 16:
-                st.warning('Enter a valid ticker, such as NVDA, BRK-B, or SPY.')
-                custom_ticker = ''
-            else:
-                benchmark_symbols.append(custom_ticker)
-        prices = benchmark_prices(tuple(benchmark_symbols), period='5y')
-        for symbol in benchmark_symbols:
-            if symbol in prices.columns:
-                series = prices[symbol].dropna()
-                if not series.empty:
-                    lines[symbol] = series
-            elif symbol == custom_ticker:
-                st.warning(f'No price history was returned for {symbol}. Check the ticker.')
+        prices = benchmark_prices(tuple(symbols_to_compare), period='5y')
+        for ticker in symbols_to_compare:
+            if ticker not in prices.columns:
+                if ticker == custom_ticker:
+                    st.warning(f'No historical prices found for {ticker}.')
+                continue
+            series = prices[ticker].dropna().sort_index()
+            series = series.loc[series.index >= cutoff]
+            if not series.empty:
+                lines[ticker] = normalize(series)
     except Exception as exc:
-        st.warning(f'Benchmark or ticker prices unavailable: {type(exc).__name__}: {exc}')
+        st.warning(f'Could not retrieve comparison prices: {exc}')
+
     if lines:
-        # Rebase all lines to the first shared observation, without inventing prices.
-        first_dates = [series.dropna().index.min() for series in lines.values() if not series.dropna().empty]
-        last_dates = [series.dropna().index.max() for series in lines.values() if not series.dropna().empty]
-        if first_dates and last_dates:
-            common_start = max(first_dates)
-            common_end = min(last_dates)
-            if common_start <= common_end:
-                aligned = {}
-                for name, series in lines.items():
-                    part = series.loc[(series.index >= common_start) & (series.index <= common_end)]
-                    if not part.empty:
-                        aligned[name] = normalize(part)
-                chart(aligned, 'Growth of $10,000 · overlapping available dates', 500)
-                st.caption('Series are rebased to $10,000 on their first observation within the shared date range. Paper strategies use daily snapshots; actual account cash flows are not adjusted.')
-            else:
-                st.info('No overlapping historical dates exist for these selections. Try fewer strategies or wait for additional portfolio snapshots.')
+        chart(lines, 'Growth of $10,000 · each series begins at its own first observation',
+              520, x_start=cutoff)
+        st.caption('All lines are independently rebased to $10,000 at their first available observation on or after June 1. Personal portfolio snapshots may reflect deposits, withdrawals and changes in holdings; this is not a cash-flow-adjusted investment return.')
     else:
-        st.info('No comparison history available yet.')
+        st.info('No historical data available for the comparison yet.')
     st.caption('Adding a ticker only changes this comparison chart. It does not place trades or change Supabase holdings.')
     if 'priced' in locals() and 'total' in locals():
         st.subheader('Holdings and allocation')
@@ -519,6 +520,60 @@ elif page == 'My Portfolio':
             fig.update_layout(template='plotly_white', paper_bgcolor='#ffffff', height=330,
                               margin=dict(l=5,r=5,t=5,b=5), showlegend=True)
             st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader('Manage my holdings')
+    st.caption('Update individual tickers without replacing your portfolio CSV. All changes affect your saved holdings, not your simulated strategies.')
+    existing_tickers = sorted(holdings['ticker'].astype(str).str.upper().tolist()) if not holdings.empty else []
+    with st.form('edit_single_holding', clear_on_submit=False):
+        left, middle, right = st.columns([1.3, 1, 1])
+        with left:
+            edit_ticker = st.text_input('Ticker', placeholder='RUM').strip().upper()
+        with middle:
+            edit_action = st.selectbox('Action', ['Buy / add shares', 'Sell / subtract shares', 'Set exact shares', 'Remove holding'])
+        with right:
+            edit_qty = st.number_input('Shares', min_value=0.0, value=0.0, step=1.0, format='%.6f',
+                                       disabled=edit_action == 'Remove holding')
+        st.caption('Example: sell 100 RUM shares → ticker RUM, Sell / subtract shares, Shares 100. Your other holdings stay unchanged.')
+        submitted = st.form_submit_button('Save holding change', type='primary')
+    if submitted:
+        if not edit_ticker or len(edit_ticker) > 16 or not all(ch.isalnum() or ch in '.-' for ch in edit_ticker):
+            st.error('Enter a valid ticker symbol.')
+        elif edit_action != 'Remove holding' and edit_qty <= 0 and edit_action != 'Set exact shares':
+            st.error('Enter a positive number of shares.')
+        else:
+            try:
+                with engine.begin() as conn:
+                    # Lock the existing row so simultaneous edits cannot overwrite one another.
+                    existing = conn.execute(text('SELECT shares, cost_basis FROM personal_holdings WHERE ticker=:t FOR UPDATE'),
+                                            {'t': edit_ticker}).mappings().first()
+                    old_qty = float(existing['shares']) if existing else 0.0
+                    if edit_action == 'Buy / add shares':
+                        new_qty = old_qty + float(edit_qty)
+                    elif edit_action == 'Sell / subtract shares':
+                        new_qty = old_qty - float(edit_qty)
+                    elif edit_action == 'Set exact shares':
+                        new_qty = float(edit_qty)
+                    else:
+                        new_qty = 0.0
+                    if new_qty < -1e-8:
+                        raise ValueError(f'You only have {old_qty:g} shares of {edit_ticker}; cannot sell {edit_qty:g}.')
+                    if new_qty <= 1e-8:
+                        conn.execute(text('DELETE FROM personal_holdings WHERE ticker=:t'), {'t': edit_ticker})
+                    else:
+                        conn.execute(text("""INSERT INTO personal_holdings (ticker,shares,cost_basis)
+                                             VALUES (:t,:s,:c)
+                                             ON CONFLICT (ticker) DO UPDATE SET shares=EXCLUDED.shares"""),
+                                     {'t': edit_ticker, 's': new_qty,
+                                      'c': float(existing['cost_basis']) if existing and existing['cost_basis'] is not None else None})
+                st.cache_data.clear()
+                st.success(f'{edit_ticker}: {old_qty:g} → {max(new_qty, 0):g} shares saved.')
+                st.rerun()
+            except Exception as exc:
+                st.error(f'Could not save change: {exc}')
+
+    if existing_tickers:
+        with st.expander('Current saved share counts'):
+            show_table(holdings[['ticker', 'shares', 'cost_basis']].sort_values('ticker'), 260)
 
     with st.expander('Import or replace my holdings (CSV)', expanded=holdings.empty):
         st.caption('Upload a CSV with ticker and shares columns; cost_basis is optional. Uploading replaces the existing holdings table, but not strategy histories.')
