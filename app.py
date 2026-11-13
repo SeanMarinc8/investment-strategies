@@ -271,7 +271,9 @@ def scanner(symbols):
 
 
 def show_table(frame, height=360):
-    if frame.empty:
+    # pandas Styler has .data but no .empty attribute.
+    data = frame if isinstance(frame, pd.DataFrame) else getattr(frame, "data", None)
+    if data is None or data.empty:
         st.info('No saved records yet.')
     else:
         st.dataframe(frame, hide_index=True, use_container_width=True, height=height)
@@ -389,6 +391,18 @@ elif page == 'Intraday Trader':
         b.metric('Cash available', money(last['cash']))
         c.metric('Executed trades', len(bot_trades))
         d.metric('Last recorded date', str(last['run_date'].date()))
+    if not bot_rows.empty:
+        chart(strategy_series(snaps, [lab.DAY_BOT]), 'Intraday bot paper equity · daily closing snapshots', 340)
+    else:
+        st.info('No intraday equity snapshots have been recorded yet.')
+    st.subheader('Bot portfolio & trading history')
+    a, b = st.columns([1, 1.3])
+    with a:
+        st.markdown('**Current positions**')
+        show_table(holdings_from_snapshot(snaps, lab.DAY_BOT), 230)
+    with b:
+        st.markdown('**Recent executions**')
+        show_table(bot_trades.head(40), 280)
     st.subheader('Live momentum scan')
     watchlist = tuple(lab.MODELS.get(lab.DAY_BOT, {}).get('tickers', []))
     if st.button('Refresh five-minute scan'):
@@ -411,16 +425,6 @@ elif page == 'Intraday Trader':
             st.warning(f'Scanner unavailable: {type(exc).__name__}: {exc}')
     else:
         st.warning('No intraday watchlist found in strategy_lab.py.')
-    st.subheader('Bot portfolio & trading history')
-    a, b = st.columns([1, 1.3])
-    with a:
-        st.markdown('**Current positions**')
-        show_table(holdings_from_snapshot(snaps, lab.DAY_BOT), 230)
-    with b:
-        st.markdown('**Recent executions**')
-        show_table(bot_trades.head(40), 280)
-    if not bot_rows.empty:
-        chart(strategy_series(snaps, [lab.DAY_BOT]), 'Recorded intraday bot equity (daily snapshots)', 340)
     with st.expander('Decision log and operational limitations'):
         show_table(bot_decisions.head(80), 330)
         st.caption('The scanner is indicative, not an execution feed. GitHub scheduled jobs can be delayed or skipped; closing positions before market close is not guaranteed. The database stores one equity snapshot per day, not a full intraday equity curve.')
@@ -428,6 +432,94 @@ elif page == 'Intraday Trader':
 elif page == 'My Portfolio':
     st.caption('Your entered real holdings · market-value estimates · comparison against simulated strategies')
     holdings = table('personal_holdings')
+    if holdings.empty:
+        st.info('No personal holdings saved yet. Use the CSV importer below.')
+    else:
+        symbols = holdings['ticker'].astype(str).tolist()
+        try:
+            px = benchmark_prices(tuple(symbols), period='1mo')
+            priced = []
+            for row in holdings.itertuples(index=False):
+                s = px[row.ticker].dropna() if row.ticker in px else pd.Series(dtype=float)
+                price = float(s.iloc[-1]) if not s.empty else np.nan
+                priced.append({'Ticker': row.ticker, 'Shares': row.shares, 'Price': price,
+                               'Market value': float(row.shares) * price if pd.notna(price) else np.nan,
+                               'Cost basis': row.cost_basis})
+            priced = pd.DataFrame(priced)
+            total = priced['Market value'].sum(min_count=1)
+            a, b, c = st.columns(3)
+            a.metric('Priced market value', money(total))
+            b.metric('Positions', len(priced))
+            c.metric('Missing prices', int(priced['Price'].isna().sum()))
+        except Exception as exc:
+            st.warning(f'Holdings valuation unavailable: {exc}')
+    st.subheader('Personal portfolio history vs. paper strategies')
+    custom_ticker = st.text_input(
+        'Add any stock or ETF ticker to the comparison',
+        placeholder='e.g. NVDA, AAPL, PFE, SPY',
+        help='Enter one Yahoo Finance ticker. It is only added to this chart, not to your holdings or trading bots.'
+    ).strip().upper()
+    chosen = st.multiselect('Compare my portfolio with', strategies,
+                            default=strategies, key='personal_strategy_compare')
+    personal = table('personal_snapshots')
+    lines = strategy_series(snaps, chosen)
+    if not personal.empty and {'snapshot_date', 'market_value'}.issubset(personal.columns):
+        personal['snapshot_date'] = pd.to_datetime(personal['snapshot_date'], errors='coerce').dt.normalize()
+        personal['market_value'] = pd.to_numeric(personal['market_value'], errors='coerce')
+        personal = personal.dropna(subset=['snapshot_date', 'market_value']).sort_values('snapshot_date')
+        if not personal.empty:
+            lines['My Portfolio'] = pd.Series(personal['market_value'].values,
+                                              index=personal['snapshot_date'])
+    else:
+        st.caption('Personal history will appear after your workflow saves personal_snapshots.')
+    try:
+        benchmark_symbols = ['VOO', 'QQQ']
+        if custom_ticker and custom_ticker not in benchmark_symbols:
+            if not all(ch.isalnum() or ch in '.-' for ch in custom_ticker) or len(custom_ticker) > 16:
+                st.warning('Enter a valid ticker, such as NVDA, BRK-B, or SPY.')
+                custom_ticker = ''
+            else:
+                benchmark_symbols.append(custom_ticker)
+        prices = benchmark_prices(tuple(benchmark_symbols), period='5y')
+        for symbol in benchmark_symbols:
+            if symbol in prices.columns:
+                series = prices[symbol].dropna()
+                if not series.empty:
+                    lines[symbol] = series
+            elif symbol == custom_ticker:
+                st.warning(f'No price history was returned for {symbol}. Check the ticker.')
+    except Exception as exc:
+        st.warning(f'Benchmark or ticker prices unavailable: {type(exc).__name__}: {exc}')
+    if lines:
+        # Rebase all lines to the first shared observation, without inventing prices.
+        first_dates = [series.dropna().index.min() for series in lines.values() if not series.dropna().empty]
+        last_dates = [series.dropna().index.max() for series in lines.values() if not series.dropna().empty]
+        if first_dates and last_dates:
+            common_start = max(first_dates)
+            common_end = min(last_dates)
+            if common_start <= common_end:
+                aligned = {}
+                for name, series in lines.items():
+                    part = series.loc[(series.index >= common_start) & (series.index <= common_end)]
+                    if not part.empty:
+                        aligned[name] = normalize(part)
+                chart(aligned, 'Growth of $10,000 · overlapping available dates', 500)
+                st.caption('Series are rebased to $10,000 on their first observation within the shared date range. Paper strategies use daily snapshots; actual account cash flows are not adjusted.')
+            else:
+                st.info('No overlapping historical dates exist for these selections. Try fewer strategies or wait for additional portfolio snapshots.')
+    else:
+        st.info('No comparison history available yet.')
+    st.caption('Adding a ticker only changes this comparison chart. It does not place trades or change Supabase holdings.')
+    if 'priced' in locals() and 'total' in locals():
+        st.subheader('Holdings and allocation')
+        priced['Weight %'] = priced['Market value'] / total * 100 if pd.notna(total) and total > 0 else np.nan
+        show_table(priced.sort_values('Market value', ascending=False), 390)
+        if pd.notna(total) and total > 0:
+            fig = go.Figure(go.Pie(labels=priced['Ticker'], values=priced['Market value'].fillna(0), hole=.6))
+            fig.update_layout(template='plotly_white', paper_bgcolor='#ffffff', height=330,
+                              margin=dict(l=5,r=5,t=5,b=5), showlegend=True)
+            st.plotly_chart(fig, use_container_width=True)
+
     with st.expander('Import or replace my holdings (CSV)', expanded=holdings.empty):
         st.caption('Upload a CSV with ticker and shares columns; cost_basis is optional. Uploading replaces the existing holdings table, but not strategy histories.')
         upload = st.file_uploader('Holdings CSV', type=['csv'])
@@ -458,46 +550,6 @@ elif page == 'My Portfolio':
                         st.rerun()
             except Exception as exc:
                 st.error(f'Could not import CSV: {exc}')
-    if holdings.empty:
-        st.info('No personal holdings saved yet. Import your holdings CSV above.')
-    else:
-        symbols = holdings['ticker'].astype(str).tolist()
-        try:
-            px = benchmark_prices(tuple(symbols), period='1mo')
-            priced = []
-            for row in holdings.itertuples(index=False):
-                s = px[row.ticker].dropna() if row.ticker in px else pd.Series(dtype=float)
-                price = float(s.iloc[-1]) if not s.empty else np.nan
-                priced.append({'Ticker': row.ticker, 'Shares': row.shares, 'Price': price,
-                               'Market value': float(row.shares) * price if pd.notna(price) else np.nan,
-                               'Cost basis': row.cost_basis})
-            priced = pd.DataFrame(priced)
-            total = priced['Market value'].sum(min_count=1)
-            a, b, c = st.columns(3)
-            a.metric('Priced market value', money(total))
-            b.metric('Positions', len(priced))
-            c.metric('Missing prices', int(priced['Price'].isna().sum()))
-            st.subheader('Holdings and allocation')
-            priced['Weight %'] = priced['Market value'] / total * 100 if pd.notna(total) and total > 0 else np.nan
-            show_table(priced.sort_values('Market value', ascending=False), 390)
-            if pd.notna(total) and total > 0:
-                fig = go.Figure(go.Pie(labels=priced['Ticker'], values=priced['Market value'].fillna(0), hole=.6))
-                fig.update_layout(template='plotly_white', paper_bgcolor='#ffffff', height=330,
-                                  margin=dict(l=5,r=5,t=5,b=5), showlegend=True)
-                st.plotly_chart(fig, use_container_width=True)
-        except Exception as exc:
-            st.warning(f'Holdings valuation unavailable: {exc}')
-    personal = table('personal_snapshots')
-    if not personal.empty and {'snapshot_date', 'market_value'}.issubset(personal.columns):
-        personal['snapshot_date'] = pd.to_datetime(personal['snapshot_date'])
-        personal = personal.sort_values('snapshot_date')
-        st.subheader('Personal portfolio history vs. paper strategies')
-        lines = strategy_series(snaps, strategies)
-        lines['My Portfolio'] = pd.Series(personal['market_value'].values, index=personal['snapshot_date'])
-        chosen = st.multiselect('Compare my portfolio with', strategies, default=strategies[:3])
-        chart({n: normalize(lines[n]) for n in ['My Portfolio'] + chosen if n in lines},
-              'Indexed portfolio value · first recorded date per series')
-        st.caption('Historical personal snapshots are saved by your existing workflow. This page does not generate new personal snapshots or change your trading engine.')
 
 st.divider()
 st.caption('Educational paper trading only · Quotes may be delayed · Historical results do not predict future performance')
