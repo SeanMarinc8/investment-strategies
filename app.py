@@ -1149,6 +1149,131 @@ elif page == "AI Intraday Trader":
     st.caption("Seventh independent paper-trading model • Read-only monitoring • No brokerage orders")
     st.info("The intraday workflow runs separately from your six after-close strategies. A green GitHub Actions check means the script exited successfully, not necessarily that it traded. Outside market hours it is expected to skip.")
 
+    # Read-only scanner: reproduces the seventh bot's ranking rules.
+    # No trading functions are called from the Streamlit interface.
+    st.subheader("🔎 30-Stock Momentum Scanner")
+    st.caption(
+        "Scans the current watchlist using Yahoo Finance 5-minute bars. "
+        "The top three are indicative candidates, not guaranteed executions. "
+        "Quotes may be delayed; scanner refreshes at most once per five minutes."
+    )
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def scan_intraday_universe(symbols):
+        raw = yf.download(
+            list(symbols), period="5d", interval="5m", auto_adjust=True,
+            progress=False, threads=False, prepost=False
+        )
+        if raw.empty:
+            return pd.DataFrame(), None
+        if isinstance(raw.columns, pd.MultiIndex):
+            if "Close" not in raw.columns.get_level_values(0):
+                return pd.DataFrame(), None
+            close = raw["Close"].copy()
+        else:
+            close = raw[["Close"]].copy()
+            close.columns = [symbols[0]]
+        if isinstance(close, pd.Series):
+            close = close.to_frame(symbols[0])
+        if close.index.tz is None:
+            return pd.DataFrame(), None
+        close.index = close.index.tz_convert(ET)
+        now_et = pd.Timestamp.now(tz=ET)
+        close = close.loc[
+            (close.index.date == now_et.date()) &
+            (close.index + pd.Timedelta(minutes=5) <= now_et)
+        ].sort_index()
+        if close.empty:
+            return pd.DataFrame(), None
+        common_bar = close.index[-1]
+        rows = []
+        for symbol in symbols:
+            if symbol not in close.columns:
+                rows.append({"Ticker": symbol, "Price ($)": None, "Momentum (%)": None,
+                             "5m Change (%)": None, "Signal": "No data", "Bar Time": None})
+                continue
+            series = pd.to_numeric(close[symbol], errors="coerce").dropna()
+            if series.empty or common_bar - series.index[-1] > pd.Timedelta(minutes=5):
+                rows.append({"Ticker": symbol, "Price ($)": None, "Momentum (%)": None,
+                             "5m Change (%)": None, "Signal": "Stale / missing", "Bar Time": None})
+                continue
+            price = float(series.iloc[-1])
+            if not np.isfinite(price) or price <= 0 or len(series) < 8:
+                rows.append({"Ticker": symbol, "Price ($)": price if price > 0 else None,
+                             "Momentum (%)": None, "5m Change (%)": None,
+                             "Signal": "Insufficient bars", "Bar Time": str(series.index[-1])})
+                continue
+            fast = float(series.tail(3).mean())
+            slow = float(series.tail(8).mean())
+            strength = 100.0 * (fast / slow - 1.0)
+            recent = float(series.iloc[-4])
+            qualified = fast > slow * 1.0005 and price > recent
+            prev = float(series.iloc[-2])
+            change = 100.0 * (price / prev - 1.0) if prev > 0 else None
+            rows.append({"Ticker": symbol, "Price ($)": price,
+                         "Momentum (%)": strength, "5m Change (%)": change,
+                         "Signal": "Qualified" if qualified else "HOLD / no entry",
+                         "Bar Time": str(series.index[-1])})
+        frame = pd.DataFrame(rows)
+        qualified = frame[frame["Signal"] == "Qualified"].sort_values(
+            "Momentum (%)", ascending=False
+        )
+        top = set(qualified.head(3)["Ticker"])
+        frame["Bot Rank"] = frame["Ticker"].map(
+            {ticker: rank for rank, ticker in enumerate(qualified["Ticker"], 1)}
+        )
+        frame["Bot Favorite"] = frame["Ticker"].isin(top)
+        return frame, common_bar
+
+    watchlist = tuple(lab.MODELS.get(lab.DAY_BOT, {}).get("tickers", []))
+    if not watchlist:
+        st.warning("The intraday watchlist was not found in strategy_lab.py.")
+    else:
+        if st.button("Refresh scanner", key="refresh_intraday_scan"):
+            scan_intraday_universe.clear()
+        try:
+            with st.spinner("Checking five-minute market bars..."):
+                scan_frame, scan_bar = scan_intraday_universe(watchlist)
+            if scan_frame.empty:
+                st.info("No completed bars for the current Eastern trading day. Try during market hours.")
+            else:
+                ranked = scan_frame[scan_frame["Signal"] == "Qualified"].sort_values(
+                    "Momentum (%)", ascending=False
+                )
+                favorites = ranked.head(3)["Ticker"].tolist()
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("Watchlist", len(watchlist))
+                sc2.metric("Qualified Signals", len(ranked))
+                sc3.metric("Top Candidates", ", ".join(favorites) if favorites else "None")
+                st.caption(
+                    f"Latest completed market bar: {scan_bar.strftime('%b %d, %Y %I:%M %p ET')}. "
+                    "Momentum = (last 3-bar average / last 8-bar average − 1) × 100. "
+                    "A qualifying signal also requires price above its level three bars ago."
+                )
+                ordered = scan_frame.sort_values(
+                    ["Bot Favorite", "Momentum (%)"],
+                    ascending=[False, False], na_position="last"
+                )
+                st.dataframe(
+                    ordered[["Ticker", "Price ($)", "Momentum (%)", "5m Change (%)",
+                             "Signal", "Bot Rank", "Bot Favorite"]],
+                    hide_index=True, use_container_width=True,
+                    column_config={
+                        "Price ($)": st.column_config.NumberColumn(format="$%.2f"),
+                        "Momentum (%)": st.column_config.NumberColumn(format="%.3f%%"),
+                        "5m Change (%)": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Bot Rank": st.column_config.NumberColumn(format="%d"),
+                        "Bot Favorite": st.column_config.CheckboxColumn("Top 3")
+                    }
+                )
+                st.caption(
+                    "The scanner does not execute trades. Actual orders also depend on "
+                    "GitHub Actions timing, freshness checks, available cash, the "
+                    "entry window, and the bot's existing positions."
+                )
+        except Exception as scan_exc:
+            st.warning(f"Scanner could not retrieve market bars: {scan_exc}")
+
     bot_snapshot = bot_rows(safe_bot_table("lab_snapshots"))
     bot_trades = bot_rows(safe_bot_table("lab_trades"))
     dedicated_snapshots = [
