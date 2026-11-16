@@ -370,6 +370,67 @@ def show_table(frame, height=360):
         st.dataframe(frame, hide_index=True, use_container_width=True, height=height)
 
 
+def intraday_daily_recap(bot_trades, bot_decisions, bot_rows):
+    """Describe persisted intraday activity, without inventing missing scans/trades."""
+    now = datetime.now(ET)
+    # Prefer the most recent date with recorded intraday decisions/trades.
+    d = bot_decisions.copy()
+    t = bot_trades.copy()
+    if not d.empty:
+        d['local_date'] = d['decided_at'].dt.tz_convert(ET).dt.date
+    if not t.empty:
+        t['local_date'] = t['executed_at'].dt.tz_convert(ET).dt.date
+    available = []
+    if not d.empty:
+        available.extend(d['local_date'].dropna().tolist())
+    if not t.empty:
+        available.extend(t['local_date'].dropna().tolist())
+    if not available:
+        st.info('No saved intraday activity yet. The daily recap will appear after the bot records its first session.')
+        return
+    days = sorted(set(available), reverse=True)
+    selected_day = st.selectbox('Session report date', days, format_func=lambda x: x.strftime('%A, %B %d, %Y'), key='intraday_report_day')
+    today = now.date()
+    close_passed = now.time() >= __import__('datetime').time(16, 0)
+    is_today = selected_day == today
+    day_d = d[d['local_date'] == selected_day].sort_values('decided_at') if not d.empty else d
+    day_t = t[t['local_date'] == selected_day].sort_values('executed_at') if not t.empty else t
+    st.markdown('### ' + selected_day.strftime('%B %d, %Y') + ' — Intraday Trading Recap')
+    if is_today and not close_passed:
+        st.warning('Preliminary report: the regular US stock-market session has not closed yet (4:00 PM Eastern).')
+    elif is_today:
+        st.caption('After the scheduled close. This report reflects saved bot activity only; late or missed GitHub runs may leave it incomplete.')
+    if day_t.empty:
+        st.markdown('**Trades today:** No executed trades were recorded in the database for this session.')
+    else:
+        buys = day_t[day_t['side'].astype(str).str.upper() == 'BUY']
+        sells = day_t[day_t['side'].astype(str).str.upper() == 'SELL']
+        st.markdown(f'**Trades today:** {len(buys)} buy(s), {len(sells)} sell(s), {len(day_t)} total recorded executions.')
+        for trade in day_t.itertuples(index=False):
+            st.markdown(f'- **{str(trade.side).upper()} {trade.ticker}:** {float(trade.shares):,.4f} shares at {money(float(trade.price))} — {str(trade.reason)}')
+    holds = day_d[day_d['action'].astype(str).str.upper() == 'HOLD'] if not day_d.empty else day_d
+    st.markdown('**What was not traded, and why**')
+    if not holds.empty:
+        st.write(f'{len(holds)} saved HOLD decision(s). The latest recorded explanation: {str(holds.iloc[-1]["reason"])}.')
+    else:
+        st.write('No HOLD decisions were recorded for this session. This does not prove that every scanned ticker was traded.')
+    st.caption('The bot does not save a ticker-by-ticker rejection log. Therefore, the recap cannot reliably name every stock that was scanned but skipped.')
+    day_snap = bot_rows[bot_rows['run_date'].dt.date == selected_day].sort_values('run_date') if not bot_rows.empty else pd.DataFrame()
+    if not day_snap.empty:
+        latest = day_snap.iloc[-1]
+        try:
+            positions = json.loads(latest['positions_json'])
+            held = {k: float(v) for k, v in positions.items() if float(v) > 0}
+        except (TypeError, ValueError):
+            held = {}
+        st.write(f'**Last saved session snapshot:** Equity {money(float(latest["equity"]))}; cash {money(float(latest["cash"]))}; open positions: {", ".join(held) if held else "none"}.')
+    st.markdown('**Game plan for the next trading morning**')
+    st.write('At the next scheduled intraday run, scan the configured 30-stock watchlist using completed five-minute bars. Rank candidates by 3-bar versus 8-bar momentum, check that price is rising, and consider up to three qualifying positions. New entries are subject to available cash and a 30% equity cap per position. If no stock qualifies, stay in cash or retain positions under the strategy rules; do not force a trade.')
+    st.caption('This is the bot’s standing rules-based plan, not a prediction or a confirmed order for tomorrow. The bot enters only during its configured trading window and attempts to exit positions near 3:50 PM ET. Scheduled jobs and data availability are not guaranteed.')
+    if is_today and close_passed and day_d.empty:
+        st.warning('No decisions were recorded for today. The workflow may not have run; check GitHub Actions before treating this as a completed session report.')
+
+
 st.sidebar.markdown('## ◈ RESEARCH TERMINAL')
 st.sidebar.caption('Seven paper-trading strategies · US equities')
 page = st.sidebar.radio('Workspace', NAV, label_visibility='collapsed')
@@ -516,6 +577,10 @@ elif page == 'Intraday Trader':
             st.warning(f'Scanner unavailable: {type(exc).__name__}: {exc}')
     else:
         st.warning('No intraday watchlist found in strategy_lab.py.')
+    st.divider()
+    st.subheader('Daily after-close recap & next-session plan')
+    st.caption('Date-stamped reports built from saved trades and decision logs. Refresh saved data to load newly completed workflow runs.')
+    intraday_daily_recap(bot_trades, bot_decisions, bot_rows)
     with st.expander('Decision log and operational limitations'):
         show_table(bot_decisions.head(80), 330)
         st.caption('The scanner is indicative, not an execution feed. GitHub scheduled jobs can be delayed or skipped; closing positions before market close is not guaranteed. The database stores one equity snapshot per day, not a full intraday equity curve.')
@@ -843,7 +908,7 @@ elif page == 'Personal Wealth Manager':
     expenses = float(budget.loc[budget['category']=='Monthly expense','amount'].sum()) if not budget.empty else 0.0
     monthly_surplus = income - expenses
 
-    tabs = st.tabs(['Overview', 'Assets & debts', 'Budget & goals', 'Wealth scenarios', 'Real estate', 'Tax estimates', 'Advisor'])
+    tabs = st.tabs(['Overview', 'Assets & debts', 'Budget & goals', 'Wealth scenarios', 'Real estate', 'Tax estimates', 'Investment Guide', 'Advisor'])
     with tabs[0]:
         a,b,c,d = st.columns(4)
         a.metric('Net worth', money(net_worth))
@@ -984,6 +1049,84 @@ elif page == 'Personal Wealth Manager':
         c.metric('Estimated effective rate',f'{tax/gross*100:.1f}%' if gross>0 else '0.0%')
         st.caption('Tax brackets and deduction inputs are simplified planning assumptions. Confirm current-year amounts with IRS publications or a tax professional before making decisions.')
     with tabs[6]:
+        st.subheader('Investment Guide & Opportunity Calculator')
+        st.caption('Explore possible investments, approximate capital requirements, and hypothetical returns. Ranges are planning assumptions, not guaranteed yields, live quotes, or recommendations to buy.')
+        investment_options = [
+            {'Investment': 'High-yield savings account', 'Typical starting cash': 1, 'Illustrative annual return': '2–5%', 'Low %': 2.0, 'Base %': 3.5, 'High %': 5.0, 'Risk': 'Low (eligible deposits insured up to limits)', 'Suggested horizon': '0–3 years', 'Liquidity': 'High', 'Notes': 'Variable APY; check FDIC/NCUA insurance and current rate.'},
+            {'Investment': 'Treasury bills', 'Typical starting cash': 100, 'Illustrative annual return': '2–5%', 'Low %': 2.0, 'Base %': 3.5, 'High %': 5.0, 'Risk': 'Very low if held to maturity', 'Suggested horizon': '1–12 months', 'Liquidity': 'Maturity-based', 'Notes': 'TreasuryDirect minimum is generally $100; yields vary at auction. Selling early can change proceeds.'},
+            {'Investment': 'CDs', 'Typical starting cash': 500, 'Illustrative annual return': '2–5%', 'Low %': 2.0, 'Base %': 3.5, 'High %': 5.0, 'Risk': 'Low if insured within limits', 'Suggested horizon': '3 months–5 years', 'Liquidity': 'Limited', 'Notes': 'Bank minimums vary, often $0–$1,000+. Early-withdrawal penalties may apply.'},
+            {'Investment': 'Broad US stock index ETF', 'Typical starting cash': 25, 'Illustrative annual return': '-5–10%', 'Low %': -5.0, 'Base %': 7.0, 'High %': 10.0, 'Risk': 'High', 'Suggested horizon': '5–10+ years', 'Liquidity': 'High (market hours)', 'Notes': 'Fractional shares may permit small purchases; market losses can be much larger than shown.'},
+            {'Investment': 'Diversified bond ETF', 'Typical starting cash': 25, 'Illustrative annual return': '-2–6%', 'Low %': -2.0, 'Base %': 3.5, 'High %': 6.0, 'Risk': 'Low–moderate', 'Suggested horizon': '2–5+ years', 'Liquidity': 'High (market hours)', 'Notes': 'Bond ETF prices fluctuate with rates and credit risk; unlike individual bonds, no maturity payoff.'},
+            {'Investment': 'REIT ETF', 'Typical starting cash': 25, 'Illustrative annual return': '-8–10%', 'Low %': -8.0, 'Base %': 6.0, 'High %': 10.0, 'Risk': 'High', 'Suggested horizon': '5–10+ years', 'Liquidity': 'High (market hours)', 'Notes': 'Real estate exposure without a property down payment; dividends and prices fluctuate.'},
+            {'Investment': 'Individual stocks', 'Typical starting cash': 25, 'Illustrative annual return': '-20–15%', 'Low %': -20.0, 'Base %': 7.0, 'High %': 15.0, 'Risk': 'Very high', 'Suggested horizon': '5+ years', 'Liquidity': 'High (market hours)', 'Notes': 'Company-specific risk; outcomes may include permanent loss.'},
+            {'Investment': 'Crypto assets', 'Typical starting cash': 10, 'Illustrative annual return': '-50–30%', 'Low %': -50.0, 'Base %': 0.0, 'High %': 30.0, 'Risk': 'Speculative / very high', 'Suggested horizon': 'Only risk capital', 'Liquidity': 'Varies', 'Notes': 'Illustrative stress scenarios, not an expected return; total loss is possible.'},
+            {'Investment': 'Rental property / house hack', 'Typical starting cash': 25000, 'Illustrative annual return': 'Property-specific', 'Low %': -5.0, 'Base %': 5.0, 'High %': 10.0, 'Risk': 'High, concentrated, leveraged', 'Suggested horizon': '5–10+ years', 'Liquidity': 'Low', 'Notes': 'Example cash-to-close only; actual amount depends on price, loan eligibility, closing costs, repairs and reserves. Use Real estate tab.'},
+            {'Investment': 'Small business / side hustle', 'Typical starting cash': 500, 'Illustrative annual return': 'Not meaningfully standardized', 'Low %': -100.0, 'Base %': 0.0, 'High %': 20.0, 'Risk': 'Very high', 'Suggested horizon': 'Variable', 'Liquidity': 'Low', 'Notes': 'Returns depend on labor, sales, expenses and execution. Treat modeled returns as placeholders only.'},
+        ]
+        options_df = pd.DataFrame(investment_options)
+        st.markdown('**Compare investment types**')
+        st.dataframe(options_df[['Investment', 'Typical starting cash', 'Illustrative annual return', 'Risk', 'Suggested horizon', 'Liquidity']],
+                     hide_index=True, use_container_width=True, column_config={'Typical starting cash': st.column_config.NumberColumn('Example minimum ($)', format='$%.0f')})
+        st.caption('Example minimums are illustrative, not verified current product minimums. Return ranges are deliberately broad scenario inputs and are not statistical confidence intervals. Taxes, fees, and inflation reduce real outcomes.')
+        selected_option = st.selectbox('Explore an investment', [item['Investment'] for item in investment_options], key='guide_investment')
+        option = next(item for item in investment_options if item['Investment'] == selected_option)
+        st.write('**How it works:** ' + option['Notes'])
+        st.write(f"**Risk:** {option['Risk']} · **Typical horizon:** {option['Suggested horizon']} · **Liquidity:** {option['Liquidity']}")
+        st.divider()
+        st.markdown('**How much do I need, and how long will it take?**')
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            initial_cash = st.number_input('Cash available for this investment ($)', min_value=0.0, value=0.0, step=100.0, key='guide_cash')
+            minimum = st.number_input('Target amount to start ($)', min_value=1.0, value=float(option['Typical starting cash']), step=100.0, key='guide_minimum')
+        with c2:
+            monthly_saving = st.number_input('Monthly amount you can set aside ($)', min_value=0.0, value=float(max(monthly_surplus, 0.0)), step=50.0, key='guide_monthly')
+            initial_investment = st.number_input('Amount to invest initially ($)', min_value=0.0, value=float(max(option['Typical starting cash'], 100.0)), step=100.0, key='guide_initial_investment')
+        with c3:
+            target_balance = st.number_input('Future portfolio value goal ($)', min_value=1.0, value=10000.0, step=1000.0, key='guide_target')
+            assumed_return = st.number_input('Assumed annual return (%)', min_value=-90.0, max_value=100.0, value=float(option['Base %']), step=0.5, key='guide_return')
+        shortfall = max(0.0, minimum - initial_cash)
+        if shortfall == 0:
+            affordability = 'You have enough set aside now'
+        elif monthly_saving <= 0:
+            affordability = 'Enter monthly savings to estimate'
+        else:
+            import math
+            affordability = f'{math.ceil(shortfall / monthly_saving):,} months'
+        st.metric('Time to save the starting amount', affordability)
+        st.caption('This assumes you save the entered monthly amount without earning interest and without drawing from emergency reserves.')
+        years_to_show = st.slider('Investment growth horizon (years)', 1, 40, 15, key='guide_years')
+        monthly_rate = (1 + assumed_return / 100) ** (1 / 12) - 1
+        balance = initial_investment
+        path = [balance]
+        month_reached = 0 if balance >= target_balance else None
+        for month in range(1, years_to_show * 12 + 1):
+            balance = balance * (1 + monthly_rate) + monthly_saving
+            if month % 12 == 0:
+                path.append(balance)
+            if month_reached is None and balance >= target_balance:
+                month_reached = month
+        d1, d2, d3 = st.columns(3)
+        d1.metric(f'Projected value in {years_to_show} years', money(balance))
+        d2.metric('Total contributed', money(initial_investment + monthly_saving * 12 * years_to_show))
+        d3.metric('Time to target', 'Already reached' if month_reached == 0 else f'{month_reached} months' if month_reached is not None else f'Not within {years_to_show} years')
+        growth_fig = go.Figure()
+        growth_fig.add_trace(go.Scatter(x=list(range(years_to_show + 1)), y=path, mode='lines', name='Hypothetical balance'))
+        growth_fig.add_hline(y=target_balance, line_dash='dash', annotation_text='Goal')
+        growth_fig.update_layout(template='plotly_white', height=350, xaxis_title='Years', yaxis_tickprefix='$', margin=dict(l=10,r=10,t=25,b=10))
+        st.plotly_chart(growth_fig, use_container_width=True)
+        st.caption('Assumes a constant effective annual return compounded monthly, contributions at month-end, no taxes/fees, and no withdrawals. Real returns vary; negative scenarios can lose principal. For property and businesses, this compound-growth model is a simplified illustration and does not model cash flow, financing, or labor.')
+        st.markdown('**Compare illustrative outcomes**')
+        scenario_rows = []
+        for label, annual_rate in [('Low scenario', option['Low %']), ('Base scenario', assumed_return), ('High scenario', option['High %'])]:
+            mrate = (1 + annual_rate / 100) ** (1/12) - 1
+            val = initial_investment
+            for _ in range(years_to_show * 12):
+                val = val * (1 + mrate) + monthly_saving
+            scenario_rows.append({'Scenario': label, 'Annual assumption': f'{annual_rate:+.1f}%', 'Ending balance': val, 'Growth above contributions': val - (initial_investment + monthly_saving * years_to_show * 12)})
+        st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True,
+                     column_config={'Ending balance': st.column_config.NumberColumn(format='$%.2f'), 'Growth above contributions': st.column_config.NumberColumn(format='$%.2f')})
+        st.warning('These are educational scenarios, not predicted returns. Consider time horizon, emergency savings, debt rates, liquidity and diversification before investing. For real estate, use the detailed underwriting tab to estimate upfront cash and monthly cash flow.')
+    with tabs[7]:
         st.subheader('Wealth planning insights')
         insights = []
         if expenses <= 0 or income <= 0:
