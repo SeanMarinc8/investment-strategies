@@ -17,7 +17,7 @@ from engine import db, init
 st.set_page_config(page_title='Investment Research Terminal', page_icon='📈', layout='wide', initial_sidebar_state='expanded')
 ET = ZoneInfo('America/New_York')
 START = 10000.0
-NAV = ['Overview', 'Strategy Lab', 'Intraday Trader', 'My Portfolio']
+NAV = ['Overview', 'Strategy Lab', 'Intraday Trader', 'My Portfolio', 'Personal Wealth Manager']
 COLORS = ['#2563eb', '#7c3aed', '#059669', '#d97706', '#e11d48', '#db2777', '#0891b2']
 
 st.markdown('''<style>
@@ -77,6 +77,13 @@ def connection():
         conn.execute(text('''CREATE TABLE IF NOT EXISTS personal_snapshots (
             snapshot_date DATE PRIMARY KEY, market_value DOUBLE PRECISION NOT NULL,
             priced_count INTEGER NOT NULL, missing_count INTEGER NOT NULL)'''))
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS wealth_items (
+            id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL,
+            name TEXT NOT NULL, category TEXT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+            rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+            note TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )'''))
     return engine
 
 try:
@@ -753,6 +760,277 @@ elif page == 'My Portfolio':
                         st.rerun()
             except Exception as exc:
                 st.error(f'Could not import CSV: {exc}')
+
+elif page == 'Personal Wealth Manager':
+    st.caption('Private wealth planning workspace · manual balances and scenario assumptions · estimates, not tax or investment advice')
+
+    def wealth_rows(kind):
+        with engine.connect() as cx:
+            return pd.read_sql_query(text('SELECT id, name, category, amount, rate, note FROM wealth_items WHERE kind=:k ORDER BY category, name'), cx, params={'k': kind})
+
+    def save_wealth_item(kind, name, category, amount, rate, note, item_id=None):
+        with engine.begin() as cx:
+            if item_id is None:
+                cx.execute(text('INSERT INTO wealth_items(kind,name,category,amount,rate,note) VALUES (:k,:n,:c,:a,:r,:o)'),
+                           {'k':kind,'n':name,'c':category,'a':amount,'r':rate,'o':note})
+            else:
+                cx.execute(text('UPDATE wealth_items SET name=:n,category=:c,amount=:a,rate=:r,note=:o,updated_at=NOW() WHERE id=:id AND kind=:k'),
+                           {'k':kind,'n':name,'c':category,'a':amount,'r':rate,'o':note,'id':item_id})
+        st.rerun()
+
+    def wealth_editor(kind, categories):
+        existing = wealth_rows(kind)
+        st.markdown(f'**{kind.title()} records**')
+        if not existing.empty:
+            st.dataframe(existing.rename(columns={'amount':'Balance ($)','rate':'Annual rate (%)'}), hide_index=True, use_container_width=True)
+        choices = {'Add new': None}
+        for r in existing.itertuples(index=False):
+            choices[f'{r.name} (#{r.id})'] = int(r.id)
+        selected = st.selectbox('Select record to add or edit', list(choices), key=f'{kind}_choice')
+        item_id = choices[selected]
+        old = existing[existing['id'] == item_id].iloc[0] if item_id is not None else None
+        with st.form(f'{kind}_form'):
+            a, b = st.columns(2)
+            with a:
+                name = st.text_input('Name', value=str(old['name']) if old is not None else '', key=f'{kind}_name')
+                category = st.selectbox('Category', categories,
+                    index=categories.index(old['category']) if old is not None and old['category'] in categories else 0,
+                    key=f'{kind}_category')
+            with b:
+                amount = st.number_input('Current balance ($)', min_value=0.0, value=float(old['amount']) if old is not None else 0.0,
+                                         step=100.0, key=f'{kind}_amount')
+                rate = st.number_input('Annual interest / expected rate (%)', min_value=0.0, max_value=100.0,
+                                       value=float(old['rate']) if old is not None else 0.0, step=0.25, key=f'{kind}_rate')
+            note = st.text_input('Notes (optional)', value=str(old['note'] or '') if old is not None else '', key=f'{kind}_note')
+            save = st.form_submit_button('Save record', type='primary')
+        if save:
+            if not name.strip():
+                st.error('Please enter a name.')
+            else:
+                save_wealth_item(kind, name.strip(), category, amount, rate, note, item_id)
+        if item_id is not None:
+            with st.form(f'{kind}_delete'):
+                confirm = st.checkbox('I want to permanently delete this record')
+                delete = st.form_submit_button('Delete selected record')
+            if delete and confirm:
+                with engine.begin() as cx:
+                    cx.execute(text('DELETE FROM wealth_items WHERE id=:id AND kind=:k'), {'id':item_id,'k':kind})
+                st.rerun()
+
+    assets = wealth_rows('asset')
+    debts = wealth_rows('debt')
+    budget = wealth_rows('budget')
+    goals = wealth_rows('goal')
+    holdings_wealth = table('personal_holdings')
+    equity_value = 0.0
+    unpriced = []
+    if not holdings_wealth.empty:
+        try:
+            q = benchmark_prices(tuple(holdings_wealth['ticker'].astype(str)), period='1mo')
+            for h in holdings_wealth.itertuples(index=False):
+                series = q[h.ticker].dropna() if h.ticker in q else pd.Series(dtype=float)
+                if series.empty:
+                    unpriced.append(h.ticker)
+                else:
+                    equity_value += float(h.shares) * float(series.iloc[-1])
+        except Exception as exc:
+            st.warning(f'Unable to price investment holdings: {exc}')
+            unpriced = holdings_wealth['ticker'].astype(str).tolist()
+    asset_total = float(assets['amount'].sum()) if not assets.empty else 0.0
+    debt_total = float(debts['amount'].sum()) if not debts.empty else 0.0
+    net_worth = asset_total + equity_value - debt_total
+    income = float(budget.loc[budget['category']=='Monthly income','amount'].sum()) if not budget.empty else 0.0
+    expenses = float(budget.loc[budget['category']=='Monthly expense','amount'].sum()) if not budget.empty else 0.0
+    monthly_surplus = income - expenses
+
+    tabs = st.tabs(['Overview', 'Assets & debts', 'Budget & goals', 'Wealth scenarios', 'Real estate', 'Tax estimates', 'Advisor'])
+    with tabs[0]:
+        a,b,c,d = st.columns(4)
+        a.metric('Net worth', money(net_worth))
+        b.metric('Assets (incl. tracked stocks)', money(asset_total + equity_value))
+        c.metric('Total liabilities', money(debt_total))
+        d.metric('Monthly surplus', money(monthly_surplus))
+        st.caption('Investment holdings are imported from My Portfolio automatically. Do not also enter those same stocks under Assets, or they will be double-counted.')
+        if unpriced:
+            st.warning('Unpriced portfolio positions excluded from net worth: ' + ', '.join(unpriced))
+        labels = ['Tracked investments'] + (assets['category'].tolist() if not assets.empty else [])
+        vals = [equity_value] + (assets['amount'].astype(float).tolist() if not assets.empty else [])
+        if sum(vals) > 0:
+            fig = go.Figure(go.Pie(labels=labels, values=vals, hole=.58))
+            fig.update_layout(template='plotly_white', height=360, margin=dict(l=10,r=10,t=15,b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        st.markdown('**Financial health checks**')
+        if income > 0:
+            st.write(f'Monthly savings rate: **{monthly_surplus / income * 100:.1f}%**')
+        liquid = float(assets.loc[assets['category'].isin(['Cash / checking','Savings / emergency fund']),'amount'].sum()) if not assets.empty else 0.0
+        if expenses > 0:
+            st.write(f'Liquid cash runway: **{liquid / expenses:.1f} months** of recorded expenses')
+        st.write(f'Debt-to-assets ratio: **{debt_total / (asset_total + equity_value) * 100:.1f}%**' if asset_total + equity_value > 0 else 'Add assets to calculate debt-to-assets ratio.')
+        st.caption('Balances are manually entered and are not automatically synchronized with bank accounts.')
+    with tabs[1]:
+        left, right = st.columns(2)
+        with left:
+            wealth_editor('asset', ['Cash / checking','Savings / emergency fund','Retirement account','Crypto','Real estate','Vehicle','Business equity','Other asset'])
+        with right:
+            wealth_editor('debt', ['Student / family loan','Credit card','Auto loan','Mortgage','Personal loan','Other debt'])
+        st.info('For debt records, Annual rate (%) means APR. For assets it is informational and is not automatically used as a return forecast.')
+    with tabs[2]:
+        st.caption('Enter monthly income and expenses as separate records. Goals are targets, not current assets.')
+        left, right = st.columns(2)
+        with left:
+            wealth_editor('budget', ['Monthly income','Monthly expense'])
+        with right:
+            wealth_editor('goal', ['Emergency fund','Home down payment','Retirement','Net worth milestone','Other goal'])
+        if not goals.empty:
+            st.subheader('Goal progress')
+            for g in goals.itertuples(index=False):
+                st.write(f'**{g.name}** — target {money(g.amount)}')
+                st.progress(min(max(net_worth / float(g.amount), 0.0),1.0) if g.amount > 0 else 0.0,
+                            text=f'Net worth / target: {100*net_worth/float(g.amount):.1f}%' if g.amount > 0 else 'Enter a target')
+            st.caption('Goal progress uses total net worth as a rough proxy; it is not an earmarked savings balance.')
+    with tabs[3]:
+        st.subheader('Interactive net worth projections')
+        a,b,c = st.columns(3)
+        with a:
+            horizon = st.slider('Years to project', 1, 40, 15)
+            monthly_contribution = st.number_input('Monthly net additions ($)', value=float(max(monthly_surplus,0.0)), step=100.0)
+        with b:
+            conservative = st.number_input('Conservative annual return (%)', value=3.0, step=.5)
+            base_return = st.number_input('Base annual return (%)', value=6.0, step=.5)
+        with c:
+            optimistic = st.number_input('Optimistic annual return (%)', value=9.0, step=.5)
+            inflation = st.number_input('Annual inflation assumption (%)', value=2.5, step=.25)
+        investable = float(assets.loc[assets['category'].isin(['Cash / checking','Savings / emergency fund','Retirement account','Crypto','Business equity','Other asset']),'amount'].sum()) if not assets.empty else 0.0
+        investable += equity_value
+        st.caption('Projection starts from investable assets, not total net worth. It excludes home equity, vehicles, and outstanding debt; monthly net additions must account for debt payments. Rates are hypothetical, not forecasts.')
+        years = list(range(horizon + 1))
+        projection = pd.DataFrame({'Year':years})
+        for label, rate in [('Conservative',conservative),('Base',base_return),('Optimistic',optimistic)]:
+            monthly_rate = (1 + rate / 100) ** (1/12) - 1 if rate > -100 else 0
+            balance = investable
+            values = [balance]
+            for year in range(1,horizon+1):
+                for month in range(12):
+                    balance = balance * (1 + monthly_rate) + monthly_contribution
+                values.append(balance)
+            projection[label] = values
+        fig = go.Figure()
+        for label in ['Conservative','Base','Optimistic']:
+            fig.add_trace(go.Scatter(x=projection['Year'],y=projection[label],name=label,mode='lines'))
+        fig.update_layout(template='plotly_white', height=430, yaxis_tickprefix='$', xaxis_title='Years from today')
+        st.plotly_chart(fig,use_container_width=True)
+        a,b,c = st.columns(3)
+        for col,label in zip([a,b,c],['Conservative','Base','Optimistic']):
+            col.metric(label + ' ending assets', money(projection[label].iloc[-1]))
+        st.write(f'Base-case ending value in today\'s dollars (inflation-adjusted): **{money(projection["Base"].iloc[-1] / ((1+inflation/100)**horizon))}**')
+        st.download_button('Download scenario CSV',projection.to_csv(index=False),'wealth_scenarios.csv','text/csv')
+    with tabs[4]:
+        st.subheader('Rental property / house-hack analyzer')
+        a,b,c = st.columns(3)
+        with a:
+            home_price = st.number_input('Purchase price ($)', min_value=1000.0,value=350000.0,step=5000.0)
+            down_pct = st.number_input('Down payment (%)', min_value=0.0,max_value=100.0,value=20.0,step=1.0)
+            mortgage_rate = st.number_input('Mortgage interest rate (%)',min_value=0.0,max_value=30.0,value=6.5,step=.25)
+            term_years = st.selectbox('Loan term (years)',[15,20,30],index=2)
+        with b:
+            monthly_rent = st.number_input('Monthly rental income ($)',min_value=0.0,value=2200.0,step=100.0)
+            property_tax_pct = st.number_input('Annual property tax (% of price)',min_value=0.0,value=1.8,step=.1)
+            annual_insurance = st.number_input('Annual insurance ($)',min_value=0.0,value=1800.0,step=100.0)
+            hoa = st.number_input('Monthly HOA ($)',min_value=0.0,value=0.0,step=25.0)
+        with c:
+            vacancy_pct = st.number_input('Vacancy allowance (% of rent)',min_value=0.0,max_value=100.0,value=5.0,step=1.0)
+            maintenance_pct = st.number_input('Maintenance / capex (% of rent)',min_value=0.0,max_value=100.0,value=10.0,step=1.0)
+            management_pct = st.number_input('Property management (% of rent)',min_value=0.0,max_value=100.0,value=8.0,step=1.0)
+            closing_pct = st.number_input('Closing costs (% of price)',min_value=0.0,value=3.0,step=.5)
+        loan = home_price * (1-down_pct/100)
+        r = mortgage_rate / 1200
+        n = term_years * 12
+        payment = loan * (r*(1+r)**n)/((1+r)**n-1) if r > 0 else loan/n
+        taxes = home_price * property_tax_pct/1200
+        insurance = annual_insurance/12
+        operating = monthly_rent*(vacancy_pct+maintenance_pct+management_pct)/100 + taxes+insurance+hoa
+        noi = monthly_rent - operating
+        cash_flow = noi-payment
+        cash_invested = home_price*(down_pct+closing_pct)/100
+        a,b,c,d = st.columns(4)
+        a.metric('Monthly mortgage P&I',money(payment))
+        b.metric('Monthly cash flow',money(cash_flow))
+        c.metric('Cap rate',f'{100*noi*12/home_price:.2f}%')
+        d.metric('Cash-on-cash',f'{100*cash_flow*12/cash_invested:.2f}%' if cash_invested > 0 else '—')
+        st.write(f'Estimated upfront cash: **{money(cash_invested)}** · Monthly NOI: **{money(noi)}** · DSCR: **{noi/payment:.2f}x**' if payment > 0 else f'Upfront cash: {money(cash_invested)}')
+        st.caption('Illustrative rental underwriting. Excludes utilities, repairs beyond reserves, leasing fees, PMI, appreciation, depreciation, taxes on rental income, and sale costs. For house-hacking, rent should reflect only units rented to others.')
+    with tabs[5]:
+        st.subheader('US federal income tax estimator (planning only)')
+        st.warning('This is an illustrative bracket calculator using 2026 federal brackets for single and married filing jointly. It does not calculate a complete tax return, payroll taxes, state taxes, credits, NIIT, AMT, or capital gains tax.')
+        filing = st.selectbox('Filing status',['Single','Married filing jointly'])
+        gross = st.number_input('Annual wage / ordinary income ($)',min_value=0.0,value=95000.0,step=1000.0)
+        pretax = st.number_input('Pre-tax retirement / other adjustments ($)',min_value=0.0,value=0.0,step=500.0)
+        other_deduction = st.number_input('Estimated deduction ($) — enter your applicable 2026 amount',min_value=0.0,value=16100.0 if filing=='Single' else 32200.0,step=100.0,
+                                         help='Editable assumption. Check the IRS for the applicable standard deduction and any additional deductions.')
+        taxable = max(0.0,gross-pretax-other_deduction)
+        # Illustrative 2026 federal ordinary income brackets; confirm before relying on estimates.
+        brackets = [(12400,.10),(50400,.12),(105700,.22),(201775,.24),(256225,.32),(640600,.35),(float('inf'),.37)] if filing=='Single' else [(24800,.10),(100800,.12),(211400,.22),(403550,.24),(512450,.32),(768700,.35),(float('inf'),.37)]
+        tax = 0.0
+        lower = 0.0
+        for upper,rate in brackets:
+            portion = max(0.0,min(taxable,upper)-lower)
+            tax += portion*rate
+            lower = upper
+            if taxable <= upper:
+                break
+        a,b,c = st.columns(3)
+        a.metric('Estimated taxable income',money(taxable))
+        b.metric('Estimated federal income tax',money(tax))
+        c.metric('Estimated effective rate',f'{tax/gross*100:.1f}%' if gross>0 else '0.0%')
+        st.caption('Tax brackets and deduction inputs are simplified planning assumptions. Confirm current-year amounts with IRS publications or a tax professional before making decisions.')
+    with tabs[6]:
+        st.subheader('Wealth planning insights')
+        insights = []
+        if expenses <= 0 or income <= 0:
+            insights.append('Enter monthly income and expenses to unlock meaningful savings and emergency-fund checks.')
+        elif monthly_surplus < 0:
+            insights.append('Your recorded monthly spending exceeds income. Consider a cash-flow plan before increasing investment contributions.')
+        elif monthly_surplus > 0:
+            insights.append(f'Your recorded monthly surplus is {money(monthly_surplus)}. Consider dividing it between cash reserves, debt payoff, and long-term investing.')
+        if expenses > 0 and liquid < 3*expenses:
+            insights.append('Your entered liquid cash is below three months of recorded expenses. Consider whether your emergency reserve is adequate.')
+        if not debts.empty:
+            high = debts[debts['rate'] >= 8]
+            if not high.empty:
+                insights.append('One or more debts have APRs of 8% or higher. Compare their guaranteed interest savings with uncertain investment returns.')
+        if equity_value > 0 and asset_total+equity_value > 0 and equity_value/(asset_total+equity_value) > .8:
+            insights.append('Tracked equities make up over 80% of recorded assets. Review concentration and near-term liquidity needs.')
+        if not insights:
+            insights.append('Add more financial records to receive personalized checks and projections.')
+        for insight in insights:
+            st.write('• ' + insight)
+        st.divider()
+        st.markdown('**Optional AI wealth advisor**')
+        st.caption('Only send financial data to an external AI service if you choose to. The button below sends a summary of balances, not account numbers or credentials. Do not enter personal identifiers.')
+        question = st.text_area('Ask a financial planning question',placeholder='How should I balance saving for a down payment with retirement investing?')
+        if st.button('Ask AI advisor', type='primary'):
+            api_key = st.secrets.get('OPENAI_API_KEY','')
+            if not api_key:
+                st.info('To enable AI chat, add OPENAI_API_KEY to Streamlit Secrets. Your local wealth checks above work without it.')
+            elif not question.strip():
+                st.warning('Enter a question first.')
+            else:
+                try:
+                    import urllib.request
+                    payload = {'model':'gpt-4.1-mini','messages':[
+                        {'role':'system','content':'You are an educational financial planning assistant. Explain assumptions, uncertainty and tradeoffs. Do not claim to be a licensed advisor. Do not provide definitive tax/legal advice.'},
+                        {'role':'user','content':json.dumps({'question':question[:2000], 'financial_summary':{
+                            'assets_excluding_stocks':asset_total,'tracked_stocks':equity_value,'liabilities':debt_total,
+                            'net_worth':net_worth,'monthly_income':income,'monthly_expenses':expenses,
+                            'debt_categories':debts[['category','amount','rate']].to_dict('records') if not debts.empty else []}})}],
+                        'max_tokens':750}
+                    req = urllib.request.Request('https://api.openai.com/v1/chat/completions',
+                        data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+str(api_key),'Content-Type':'application/json'},method='POST')
+                    with urllib.request.urlopen(req,timeout=35) as response:
+                        answer = json.loads(response.read().decode())['choices'][0]['message']['content']
+                    st.markdown(answer)
+                except Exception as exc:
+                    st.error(f'AI advisor request failed: {type(exc).__name__}: {exc}')
 
 st.divider()
 st.caption('Educational paper trading only · Quotes may be delayed · Historical results do not predict future performance')
